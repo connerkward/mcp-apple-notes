@@ -84,10 +84,6 @@ const server = new Server(
   }
 );
 
-let indexingStatus: { running: boolean; progress?: string; result?: string } = {
-  running: false,
-};
-
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
@@ -143,16 +139,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             content: { type: "string" },
           },
           required: ["title", "content"],
-        },
-      },
-      {
-        name: "index-status",
-        description:
-          "Check the status of an ongoing or completed notes indexing operation",
-        inputSchema: {
-          type: "object",
-          properties: {},
-          required: [],
         },
       },
     ],
@@ -215,16 +201,25 @@ const fetchNotesBatch = async (offset: number, limit: number) => {
 
 const BATCH_SIZE = 50;
 
-export const indexNotes = async (notesTable: any) => {
+export const indexNotes = async (
+  notesTable: any,
+  progressToken?: string | number
+) => {
   const start = performance.now();
   let report = "";
   let indexed = 0;
 
-  // Get total count first
-  const { total } = await fetchNotesBatch(0, 0);
+  const sendProgress = (current: number, total: number) => {
+    if (progressToken !== undefined) {
+      server.notification({
+        method: "notifications/progress",
+        params: { progressToken, progress: current, total },
+      });
+    }
+  };
 
-  indexingStatus = { running: true, progress: `0/${total} notes` };
-  server.sendLoggingMessage({ level: "info", data: `Starting indexing of ${total} notes...` });
+  const { total } = await fetchNotesBatch(0, 0);
+  sendProgress(0, total);
 
   for (let offset = 0; offset < total; offset += BATCH_SIZE) {
     const { notes } = await fetchNotesBatch(offset, BATCH_SIZE);
@@ -251,16 +246,10 @@ export const indexNotes = async (notesTable: any) => {
       indexed += chunks.length;
     }
 
-    const progress = `${Math.min(offset + BATCH_SIZE, total)}/${total} notes`;
-    indexingStatus = { running: true, progress };
-    server.sendLoggingMessage({ level: "info", data: `Indexed ${progress}` });
+    sendProgress(Math.min(offset + BATCH_SIZE, total), total);
   }
 
   const time = performance.now() - start;
-  const result = `Indexed ${indexed} notes in ${Math.round(time / 1000)}s.`;
-  indexingStatus = { running: false, result };
-  server.sendLoggingMessage({ level: "info", data: result });
-
   return { chunks: indexed, report, allNotes: total, time };
 };
 
@@ -330,27 +319,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request, c) => {
         return createTextResponse(error.message);
       }
     } else if (name === "index-notes") {
-      if (indexingStatus.running) {
-        return createTextResponse(
-          `Indexing already in progress: ${indexingStatus.progress}. Use "index-status" to check progress.`
-        );
-      }
-      // Run in background — don't block the conversation
-      indexNotes(notesTable).catch((err) => {
-        indexingStatus = { running: false, result: `Error: ${err.message}` };
-        server.sendLoggingMessage({ level: "error", data: `Indexing failed: ${err.message}` });
-      });
-      return createTextResponse(
-        `Indexing started in the background. Use "index-status" to check progress. You'll also see progress in notifications.`
+      const progressToken = request.params._meta?.progressToken;
+      const { time, chunks, allNotes } = await indexNotes(
+        notesTable,
+        progressToken
       );
-    } else if (name === "index-status") {
-      if (indexingStatus.running) {
-        return createTextResponse(`Indexing in progress: ${indexingStatus.progress}`);
-      } else if (indexingStatus.result) {
-        return createTextResponse(`Indexing complete: ${indexingStatus.result}`);
-      } else {
-        return createTextResponse(`No indexing has been run yet.`);
-      }
+      return createTextResponse(
+        `Indexed ${chunks} notes in ${Math.round(time / 1000)}s.`
+      );
     } else if (name === "search-notes") {
       const { query } = QueryNotesSchema.parse(args);
       const combinedResults = await searchAndCombineResults(notesTable, query);
