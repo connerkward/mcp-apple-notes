@@ -235,6 +235,58 @@ const NOTES_DB = path.join(
 const CF_EPOCH = 978307200;
 const cfDate = (cf: number) => new Date((cf + CF_EPOCH) * 1000).toISOString();
 
+// Safe escaping for LanceDB filter strings (Arrow SQL syntax)
+export function escapeForFilter(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t");
+}
+
+export function calcEntropy(s: string): number {
+  const freq = new Map<string, number>();
+  for (const c of s) freq.set(c, (freq.get(c) ?? 0) + 1);
+  let e = 0;
+  for (const n of freq.values()) { const p = n / s.length; e -= p * Math.log2(p); }
+  return e;
+}
+
+export function filterContent(text: string): string {
+  return text
+    .replace(/[A-Za-z0-9+/]{60,}={0,2}/g, (m) => calcEntropy(m) > 4.5 ? "" : m)
+    .replace(/\b(AKIA[A-Z0-9]{16}|ghp_[A-Za-z0-9]{36}|-----BEGIN [A-Z ]+ KEY-----[\s\S]*?-----END [A-Z ]+ KEY-----)\b/g, "[redacted]");
+}
+
+const HASHTAG_RE = /#([A-Za-z][A-Za-z0-9_-]*)/g;
+const WIKILINK_RE = /\[\[([^\]]+)\]\]/g;
+
+export function extractTags(text: string): string[] {
+  return [...text.matchAll(HASHTAG_RE)].map(m => m[1].toLowerCase());
+}
+
+export function extractWikilinks(text: string): string[] {
+  return [...text.matchAll(WIKILINK_RE)].map(m => m[1]);
+}
+
+export function extractTablesFromText(text: string): string[][][] {
+  const tables: string[][][] = [];
+  const lines = text.split("\n");
+  let cur: string[][] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("|") && trimmed.endsWith("|")) {
+      const cells = trimmed.split("|").slice(1, -1).map(c => c.trim());
+      if (!cells.every(c => /^[-: ]+$/.test(c))) cur.push(cells); // skip separator rows
+    } else if (line.includes("\t")) {
+      const cells = line.split("\t").map(c => c.trim());
+      if (cells.length >= 2) { cur.push(cells); continue; }
+      if (cur.length >= 2) { tables.push(cur); } cur = [];
+    } else {
+      if (cur.length >= 2) tables.push(cur);
+      cur = [];
+    }
+  }
+  if (cur.length >= 2) tables.push(cur);
+  return tables;
+}
+
 // Minimal inline protobuf decoder — no external library.
 // Apple Notes ZDATA layout (reverse-engineered): outer.field2 → middle.field3 → field2 = plain text.
 function readVarint(buf: Uint8Array, pos: number): [bigint, number] {
@@ -427,7 +479,7 @@ export const indexNotes = async (
   const allTitles = new Set(allNotes.map((n) => n.title));
   const deletedTitles = [...existingMap.keys()].filter((t) => !allTitles.has(t));
   for (const title of deletedTitles) {
-    await notesTable.delete(`title = '${title.replace(/'/g, "''")}'`);
+    await notesTable.delete(`title = '${escapeForFilter(title)}'`);
   }
 
   // 4. Filter to only new or modified notes
@@ -454,7 +506,7 @@ export const indexNotes = async (
   // 5. Delete stale versions of modified notes before re-embedding
   for (const note of toIndex) {
     if (existingMap.has(note.title)) {
-      await notesTable.delete(`title = '${note.title.replace(/'/g, "''")}'`);
+      await notesTable.delete(`title = '${escapeForFilter(note.title)}'`);
     }
   }
 
@@ -477,6 +529,7 @@ export const indexNotes = async (
   for (const note of toIndex) {
     let text = note.content ?? "";
     if (td) { try { text = td(text); } catch { /* keep original */ } }
+    text = filterContent(text);
 
     const splits = text.length > CHUNK_SIZE
       ? await splitter.splitText(text)
@@ -760,6 +813,136 @@ server.tool("update-note", UpdateNoteSchema.shape, async ({ title, content }) =>
   return createTextResponse(`Updated note "${title}".`);
 });
 
+server.tool("list-folders", {}, async () => {
+  try {
+    const db = new Database(NOTES_DB, { readonly: true });
+    try {
+      const rows = db.query<{ path: string; noteCount: number }, []>(`
+        ${FOLDER_CTE}
+        SELECT fp.path, COUNT(n.Z_PK) AS noteCount
+        FROM folder_path fp
+        LEFT JOIN ZICCLOUDSYNCINGOBJECT n ON n.ZFOLDER = fp.id AND n.Z_ENT = 11 AND n.ZMARKEDFORDELETION = 0
+        GROUP BY fp.id, fp.path
+        ORDER BY fp.path
+      `).all();
+      return createTextResponse(JSON.stringify(rows));
+    } finally { db.close(); }
+  } catch (err) { handleDbError(err); }
+});
+
+server.tool("list-tags", {}, async () => {
+  const { notesTable } = await createNotesTable();
+  const rows = await notesTable.query().select(["title", "content"]).toArray();
+  const tagCounts = new Map<string, number>();
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (seen.has(row.title)) continue;
+    seen.add(row.title);
+    for (const tag of extractTags(row.content ?? "")) {
+      tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+    }
+  }
+  const sorted = [...tagCounts.entries()]
+    .sort(([, a], [, b]) => b - a)
+    .map(([tag, count]) => ({ tag: `#${tag}`, count }));
+  return createTextResponse(JSON.stringify(sorted));
+});
+
+server.tool("search-by-tag", { tag: z.string().describe("Hashtag to search for, with or without leading #") }, async ({ tag }) => {
+  const { notesTable } = await createNotesTable();
+  const normalized = tag.replace(/^#/, "").toLowerCase();
+  const rows = await notesTable.query().select(["title", "folder", "modification_date", "content"]).toArray();
+  const seen = new Set<string>();
+  const results: any[] = [];
+  for (const row of rows) {
+    if (seen.has(row.title)) continue;
+    seen.add(row.title);
+    if (extractTags(row.content ?? "").includes(normalized)) {
+      results.push({ title: row.title, folder: row.folder, modified: row.modification_date });
+    }
+  }
+  return createTextResponse(JSON.stringify(results));
+});
+
+server.tool("related-notes", {
+  title: z.string().describe("Exact title of the source note"),
+  limit: z.number().int().min(1).max(20).optional().describe("Max results (default 10)"),
+}, async ({ title, limit = 10 }) => {
+  await syncReindexIfNeeded();
+  const note = await getNoteDetailsByTitle(title);
+  if (!note?.title) return createTextResponse(JSON.stringify({ error: `Note not found: "${title}"` }));
+
+  const sourceTags = new Set(extractTags(note.content ?? ""));
+  const sourceLinks = new Set(extractWikilinks(note.content ?? "").map(l => l.toLowerCase()));
+
+  const { notesTable } = await createNotesTable();
+  // Vector similarity over title + first 500 chars
+  const [vectorResults, allRows] = await Promise.all([
+    notesTable.search(`${note.title} ${(note.content ?? "").slice(0, 500)}`, "vector").limit(50).toArray(),
+    notesTable.query().select(["title", "folder", "modification_date", "content"]).toArray(),
+  ]);
+
+  const scores = new Map<string, number>();
+  const metaMap = new Map<string, { folder: string; modified: string }>();
+
+  const seen = new Set<string>();
+  for (const row of allRows) {
+    if (row.title === title || seen.has(row.title)) continue;
+    seen.add(row.title);
+    metaMap.set(row.title, { folder: row.folder, modified: row.modification_date });
+
+    let score = 0;
+    for (const t of extractTags(row.content ?? "")) if (sourceTags.has(t)) score += 0.8;
+    if (sourceLinks.has(row.title.toLowerCase())) score += 1.0; // outgoing wikilink
+    const rowLinks = new Set(extractWikilinks(row.content ?? "").map(l => l.toLowerCase()));
+    if (rowLinks.has(title.toLowerCase())) score += 1.0; // incoming backlink
+    if (score > 0) scores.set(row.title, score);
+  }
+
+  vectorResults.forEach((r: any, idx: number) => {
+    if (r.title === title) return;
+    scores.set(r.title, (scores.get(r.title) ?? 0) + 0.5 / (60 + idx));
+    if (!metaMap.has(r.title)) metaMap.set(r.title, { folder: r.folder, modified: r.modification_date });
+  });
+
+  const results = [...scores.entries()]
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, limit)
+    .map(([t, score]) => ({ title: t, score: Math.round(score * 100) / 100, ...metaMap.get(t) }));
+
+  return createTextResponse(JSON.stringify(results));
+});
+
+server.tool("get-tables", { title: z.string().describe("Exact note title") }, async ({ title }) => {
+  const note = await getNoteDetailsByTitle(title);
+  if (!note?.title) return createTextResponse(JSON.stringify({ error: `Note not found: "${title}"` }));
+  const tables = extractTablesFromText(note.content ?? "");
+  return createTextResponse(JSON.stringify({ title: note.title, tables, count: tables.length }));
+});
+
+server.tool("check-changes", {}, async () => {
+  const currentMax = getNotesMaxModDate();
+  const hasChanges = currentMax !== null && (lastIndexedModDate === null || currentMax > lastIndexedModDate);
+  let changedCount = 0;
+  if (hasChanges && lastIndexedModDate !== null) {
+    try {
+      const db = new Database(NOTES_DB, { readonly: true });
+      try {
+        const row = db.query<{ n: number }, [number]>(
+          "SELECT COUNT(*) AS n FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = 11 AND ZMARKEDFORDELETION = 0 AND ZMODIFICATIONDATE1 > ?"
+        ).get(lastIndexedModDate);
+        changedCount = row?.n ?? 0;
+      } finally { db.close(); }
+    } catch { /* ignore */ }
+  }
+  return createTextResponse(JSON.stringify({
+    hasChanges,
+    changedCount: hasChanges ? changedCount : 0,
+    lastIndexedAt: lastIndexedModDate ? new Date((lastIndexedModDate + CF_EPOCH) * 1000).toISOString() : null,
+    currentMaxModDate: currentMax ? new Date((currentMax + CF_EPOCH) * 1000).toISOString() : null,
+  }));
+});
+
 server.tool("search-notes", QueryNotesSchema.shape, async ({ query, folder, modifiedAfter, modifiedBefore }) => {
   await syncReindexIfNeeded();
   const { notesTable } = await createNotesTable();
@@ -854,7 +1037,9 @@ server.tool("cancel-index-notes", JobIdSchema.shape, async ({ jobId }) => {
   return createTextResponse(JSON.stringify({ jobId: job.id, cancelled: true }));
 });
 
-// Start the server — HTTP mode for MCP Apps UI, stdio as fallback
+// Start the server — only when run directly, not when imported by tests
+if (import.meta.main) {
+
 const PORT = parseInt(process.env.MCP_PORT ?? "3741");
 
 if (process.argv.includes("--stdio")) {
@@ -887,6 +1072,8 @@ if (process.argv.includes("--stdio")) {
     console.error(`Expose with: npx cloudflared tunnel --url http://localhost:${PORT}`);
   });
 }
+
+} // end import.meta.main
 
 /**
  * Search for notes by title or content using both vector and FTS search.

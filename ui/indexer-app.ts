@@ -16,6 +16,14 @@ type JobStatus = {
 
 type LogsResp = { jobId: string; nextOffset: number; lines: string[] };
 
+type IndexHealth = {
+  lastIndexedAt: string | null;
+  currentMaxModDate: string | null;
+  inSync: boolean;
+  activeJob: boolean;
+  totalNotesInApple: number | null;
+};
+
 const $ = (id: string) => document.getElementById(id) as HTMLElement;
 const statusEl = $("status");
 const pillEl = $("pill");
@@ -31,25 +39,19 @@ let logsOffset = 0;
 let pollTimer: number | null = null;
 let logsTimer: number | null = null;
 
-function fmt(n: number) {
-  return new Intl.NumberFormat().format(n);
-}
-
-function clamp01(x: number) {
-  return Math.max(0, Math.min(1, x));
-}
+function fmt(n: number) { return new Intl.NumberFormat().format(n); }
+function clamp01(x: number) { return Math.max(0, Math.min(1, x)); }
 
 function setUI(p: number, t: number, message?: string) {
   const pct = t > 0 ? clamp01(p / t) : 0;
   barEl.style.width = `${(pct * 100).toFixed(1)}%`;
   statusEl.textContent = message ?? "";
-  pillEl.textContent = `${fmt(p)} / ${fmt(t)}`;
+  pillEl.textContent = t > 0 ? `${fmt(p)} / ${fmt(t)}` : "—";
 }
 
 function appendLogs(lines: string[]) {
   if (!lines.length) return;
-  const atBottom =
-    Math.abs(logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 8;
+  const atBottom = Math.abs(logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight) < 8;
   logEl.textContent += lines.join("\n") + "\n";
   if (atBottom) logEl.scrollTop = logEl.scrollHeight;
 }
@@ -61,17 +63,50 @@ function stopPolling() {
   logsTimer = null;
 }
 
+async function showHealth() {
+  try {
+    const res = await app.callServerTool({ name: "index-health", arguments: {} });
+    const txt = (res as ToolResult).content?.find((c: any) => c.type === "text")?.text;
+    if (!txt) return;
+    const h = JSON.parse(txt) as IndexHealth;
+
+    const lastIndexed = h.lastIndexedAt
+      ? new Date(h.lastIndexedAt).toLocaleString()
+      : "Never";
+    const syncIcon = h.inSync ? "✅" : "⚠️ out of sync";
+    const notes = h.totalNotesInApple != null ? fmt(h.totalNotesInApple) : "?";
+
+    setUI(0, 0, `${syncIcon} — ${notes} notes · Last indexed: ${lastIndexed}`);
+    pillEl.textContent = h.inSync ? "In sync" : "Stale";
+    barEl.style.width = h.inSync ? "100%" : "0%";
+    appendLogs([
+      `Index health`,
+      `  Notes in Apple Notes: ${notes}`,
+      `  Last indexed: ${lastIndexed}`,
+      `  In sync: ${h.inSync ? "yes" : "no — run Start / Retry to update"}`,
+    ]);
+  } catch {
+    statusEl.textContent = "Could not load index health.";
+  }
+}
+
 async function pollStatusOnce() {
   if (!jobId) return;
-  const res = await app.callServerTool({
-    name: "index-notes-status",
-    arguments: { jobId },
-  });
-  const txt = (res as ToolResult).content?.find((c: any) => c.type === "text")
-    ?.text;
+  const res = await app.callServerTool({ name: "index-notes-status", arguments: { jobId } });
+  const txt = (res as ToolResult).content?.find((c: any) => c.type === "text")?.text;
   if (!txt) return;
-  const s = JSON.parse(txt) as JobStatus;
 
+  // Unknown jobId (old chat, server restarted) — fall back to health view
+  if (txt.startsWith("Unknown jobId")) {
+    stopPolling();
+    jobId = null;
+    logEl.textContent = "";
+    logsOffset = 0;
+    await showHealth();
+    return;
+  }
+
+  const s = JSON.parse(txt) as JobStatus;
   setUI(s.progress ?? 0, s.total ?? 0, s.message);
   cancelBtn.disabled = s.status !== "running";
 
@@ -86,12 +121,8 @@ async function pollStatusOnce() {
 
 async function pollLogsOnce() {
   if (!jobId) return;
-  const res = await app.callServerTool({
-    name: "index-notes-logs",
-    arguments: { jobId, offset: logsOffset },
-  });
-  const txt = (res as ToolResult).content?.find((c: any) => c.type === "text")
-    ?.text;
+  const res = await app.callServerTool({ name: "index-notes-logs", arguments: { jobId, offset: logsOffset } });
+  const txt = (res as ToolResult).content?.find((c: any) => c.type === "text")?.text;
   if (!txt) return;
   const l = JSON.parse(txt) as LogsResp;
   logsOffset = l.nextOffset ?? logsOffset;
@@ -108,24 +139,17 @@ function startPolling() {
 
 async function startJob() {
   setUI(0, 0, "Starting…");
-  pillEl.textContent = "—";
   logEl.textContent = "";
   logsOffset = 0;
   cancelBtn.disabled = true;
 
   const res = await app.callServerTool({ name: "index-notes", arguments: {} });
-  const txt = (res as ToolResult).content?.find((c: any) => c.type === "text")
-    ?.text;
-  if (!txt) {
-    statusEl.textContent = "Failed to start job.";
-    return;
-  }
+  const txt = (res as ToolResult).content?.find((c: any) => c.type === "text")?.text;
+  if (!txt) { statusEl.textContent = "Failed to start job."; return; }
+
   const payload = JSON.parse(txt) as { jobId?: string; message?: string };
   jobId = payload.jobId ?? null;
-  if (!jobId) {
-    statusEl.textContent = payload.message ?? "Failed to start job.";
-    return;
-  }
+  if (!jobId) { statusEl.textContent = payload.message ?? "Failed to start job."; return; }
 
   appendLogs([`Started job ${jobId}`]);
   startPolling();
@@ -134,18 +158,13 @@ async function startJob() {
 cancelBtn.addEventListener("click", async () => {
   if (!jobId) return;
   cancelBtn.disabled = true;
-  await app.callServerTool({
-    name: "cancel-index-notes",
-    arguments: { jobId },
-  });
+  await app.callServerTool({ name: "cancel-index-notes", arguments: { jobId } });
   appendLogs(["Cancellation requested."]);
 });
 
 retryBtn.addEventListener("click", () => void startJob());
 
 app.ontoolresult = (result: ToolResult) => {
-  // When this UI is opened by the host after calling a tool, the initial tool
-  // result is delivered here. If it contains a jobId, attach; otherwise start.
   const txt = result.content?.find((c: any) => c.type === "text")?.text;
   if (txt) {
     try {
@@ -156,9 +175,7 @@ app.ontoolresult = (result: ToolResult) => {
         startPolling();
         return;
       }
-    } catch {
-      // ignore
-    }
+    } catch { /* ignore */ }
   }
   void startJob();
 };
@@ -167,4 +184,3 @@ app.connect().catch((err: unknown) => {
   statusEl.textContent = `Connection error: ${err instanceof Error ? err.message : String(err)}`;
   logEl.textContent = `app.connect() failed:\n${err instanceof Error ? err.stack ?? err.message : String(err)}`;
 });
-
