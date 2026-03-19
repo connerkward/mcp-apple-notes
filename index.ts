@@ -24,6 +24,8 @@ import {
  */
 let dbPromise: Promise<any> | null = null;
 let extractorPromise: Promise<any> | null = null;
+let extractorIdleTimer: ReturnType<typeof setTimeout> | null = null;
+const EXTRACTOR_IDLE_MS = 10 * 60 * 1000; // 10 minutes
 let turndownPromise: Promise<(html: string) => string> | null = null;
 let notesTableSchemaPromise: Promise<any> | null = null;
 
@@ -39,6 +41,15 @@ const getDb = async () => {
   return await dbPromise;
 };
 
+const touchExtractor = () => {
+  if (extractorIdleTimer) clearTimeout(extractorIdleTimer);
+  extractorIdleTimer = setTimeout(() => {
+    extractorPromise = null;
+    extractorIdleTimer = null;
+    console.error("Embedding model unloaded after 10m idle");
+  }, EXTRACTOR_IDLE_MS);
+};
+
 const getExtractor = async () => {
   if (!extractorPromise) {
     extractorPromise = (async () => {
@@ -46,6 +57,7 @@ const getExtractor = async () => {
       return await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
     })();
   }
+  touchExtractor();
   return await extractorPromise;
 };
 
