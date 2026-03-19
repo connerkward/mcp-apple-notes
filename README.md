@@ -24,6 +24,8 @@ A [Model Context Protocol (MCP)](https://www.anthropic.com/news/model-context-pr
 | Non-blocking index UI | ✅ Live progress | ❌ | ❌ | ❌ | ❌ |
 | Incremental indexing | ✅ | ❌ | ✅ | ❌ | ❌ |
 | Update existing notes | ✅ | ❌ | ✅ | ❌ | ❌ |
+| Tags + wikilinks | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Related notes | ✅ Multi-signal | ❌ | ❌ | ❌ | ❌ |
 
 > JXA on macOS Sequoia: processes without a bundle ID are silently auto-denied Automation permission. This fork reads SQLite directly.
 
@@ -73,8 +75,14 @@ bun install
 | `search-notes` | Semantic + FTS search; optional `folder`, `modifiedAfter`, `modifiedBefore` |
 | `get-note` | Full note by title; fuzzy fallback on no exact match |
 | `list-notes` | Notes sorted by recency; optional `folder`, date range, `limit` |
+| `list-folders` | All folders with note counts |
+| `list-tags` | All `#hashtags` across notes, sorted by frequency |
+| `search-by-tag` | Notes containing a specific hashtag |
+| `related-notes` | Related notes via shared tags, `[[wikilinks]]`, and vector similarity |
+| `get-tables` | Extract pipe/tab-separated tables from a note |
 | `create-note` | Create a note |
 | `update-note` | Edit an existing note |
+| `check-changes` | Check if notes changed since last index (without triggering re-index) |
 | `index-health` | Sync status, last indexed time, note count |
 
 ## Search & Ranking

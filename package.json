@@ -13,7 +13,7 @@
     "postinstall": "bun run build:ui && open 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles' 2>/dev/null; true",
     "start": "bun index.ts",
     "purge-db": "rm -rf ~/.mcp-apple-notes",
-    "test": "npx tsx index.test.ts"
+    "test": "bun test ./test.ts"
   },
   "exports": {
     ".": "./index.ts"
