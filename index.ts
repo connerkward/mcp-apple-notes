@@ -98,6 +98,7 @@ const getNotesTableSchema = async () => {
         content: func.sourceField(new Utf8()),
         creation_date: func.sourceField(new Utf8()),
         modification_date: func.sourceField(new Utf8()),
+        folder: func.sourceField(new Utf8()),
         vector: func.vectorField(),
       });
     })();
@@ -107,10 +108,18 @@ const getNotesTableSchema = async () => {
 
 const QueryNotesSchema = z.object({
   query: z.string(),
+  folder: z.string().optional().describe("Filter by folder name (exact path segment match). E.g. 'Notes' or 'ACADEMIA'."),
+  modifiedAfter: z.string().optional().describe("ISO date — only notes modified after this date"),
+  modifiedBefore: z.string().optional().describe("ISO date — only notes modified before this date"),
 });
 
 const GetNoteSchema = z.object({
-  title: z.string(),
+  title: z.string().describe("Exact or partial note title. Falls back to semantic search if no exact match."),
+});
+
+const UpdateNoteSchema = z.object({
+  title: z.string().describe("Exact title of the note to update"),
+  content: z.string().describe("New full content for the note"),
 });
 
 const CreateNoteSchema = z.object({
@@ -145,6 +154,48 @@ type IndexJob = {
 };
 
 const indexJobs = new Map<string, IndexJob>();
+
+// Track the max modification_date at the time of last successful index
+let lastIndexedModDate: number | null = null;
+
+const getNotesMaxModDate = (): number | null => {
+  try {
+    const db = new Database(NOTES_DB, { readonly: true });
+    try {
+      const row = db.query<{ d: number | null }, []>(
+        "SELECT MAX(ZMODIFICATIONDATE1) AS d FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = 11 AND ZMARKEDFORDELETION = 0"
+      ).get();
+      return row?.d ?? null;
+    } finally { db.close(); }
+  } catch { return null; }
+};
+
+const isActiveIndexJob = () =>
+  [...indexJobs.values()].some((j) => j.status === "running" || j.status === "queued");
+
+// Call before search: if notes have changed, re-index synchronously before returning.
+// Incremental, so usually < 1s for a few changed notes.
+const syncReindexIfNeeded = async () => {
+  const maxMod = getNotesMaxModDate();
+  if (maxMod === null) return;
+  if (lastIndexedModDate !== null && maxMod <= lastIndexedModDate) return;
+
+  // If a job is already running (e.g. manual index-notes), wait for it to finish
+  if (isActiveIndexJob()) {
+    await new Promise<void>((resolve) => {
+      const iv = setInterval(() => {
+        if (!isActiveIndexJob()) { clearInterval(iv); resolve(); }
+      }, 200);
+    });
+    lastIndexedModDate = getNotesMaxModDate();
+    return;
+  }
+
+  // Run inline incremental re-index — blocks until done
+  const { notesTable } = await createNotesTable();
+  await indexNotes(notesTable);
+  lastIndexedModDate = getNotesMaxModDate();
+};
 
 const server = new McpServer({
   name: "my-apple-notes-mcp",
@@ -182,15 +233,47 @@ const NOTES_DB = path.join(
 
 // CoreData timestamps: seconds since 2001-01-01
 const CF_EPOCH = 978307200;
-const cfDate = (cf: number) => new Date((cf + CF_EPOCH) * 1000).toLocaleString();
+const cfDate = (cf: number) => new Date((cf + CF_EPOCH) * 1000).toISOString();
+
+// Minimal inline protobuf decoder — no external library.
+// Apple Notes ZDATA layout (reverse-engineered): outer.field2 → middle.field3 → field2 = plain text.
+function readVarint(buf: Uint8Array, pos: number): [bigint, number] {
+  let result = 0n, shift = 0n;
+  while (pos < buf.length) {
+    const b = buf[pos++];
+    result |= BigInt(b & 0x7f) << shift;
+    shift += 7n;
+    if (!(b & 0x80)) break;
+  }
+  return [result, pos];
+}
+
+function walkProto(buf: Uint8Array, cb: (field: number, wire: number, val: bigint | Uint8Array) => void) {
+  let pos = 0;
+  while (pos < buf.length) {
+    let tag: bigint;
+    [tag, pos] = readVarint(buf, pos);
+    const field = Number(tag >> 3n), wire = Number(tag & 7n);
+    if (wire === 0) { let v: bigint; [v, pos] = readVarint(buf, pos); cb(field, wire, v); }
+    else if (wire === 1) { pos += 8; }
+    else if (wire === 2) { let len: bigint; [len, pos] = readVarint(buf, pos); cb(field, wire, buf.slice(pos, pos + Number(len))); pos += Number(len); }
+    else if (wire === 5) { pos += 4; }
+    else break;
+  }
+}
 
 function extractText(data: Uint8Array): string {
   try {
     const buf = gunzipSync(Buffer.from(data));
-    return buf.toString("utf8")
-      .replace(/[^\x20-\x7E\x0A\x0D\u00A0-\uFFFF]/g, " ")
-      .replace(/ {3,}/g, " ")
-      .trim();
+    let text = "";
+    walkProto(buf, (f1, w1, v1) => {
+      if (f1 === 2 && w1 === 2) walkProto(v1 as Uint8Array, (f2, w2, v2) => {
+        if (f2 === 3 && w2 === 2) walkProto(v2 as Uint8Array, (f3, w3, v3) => {
+          if (f3 === 2 && w3 === 2 && !text) text = Buffer.from(v3 as Uint8Array).toString("utf8");
+        });
+      });
+    });
+    return text;
   } catch { return ""; }
 }
 
@@ -211,22 +294,39 @@ function handleDbError(err: unknown): never {
   throw err;
 }
 
+const FOLDER_CTE = `
+  WITH RECURSIVE folder_path(id, path) AS (
+    SELECT Z_PK, ZTITLE2
+    FROM ZICCLOUDSYNCINGOBJECT
+    WHERE Z_ENT = 14 AND ZPARENT IS NULL AND ZTITLE2 IS NOT NULL
+    UNION ALL
+    SELECT f.Z_PK, fp.path || '/' || f.ZTITLE2
+    FROM ZICCLOUDSYNCINGOBJECT f
+    JOIN folder_path fp ON f.ZPARENT = fp.id
+    WHERE f.Z_ENT = 14 AND f.ZTITLE2 IS NOT NULL
+  )
+`;
+
 const getAllNoteDetails = async () => {
   try {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
       const rows = db.query<any, []>(`
+        ${FOLDER_CTE}
         SELECT n.ZTITLE1 AS title, n.ZCREATIONDATE1 AS created,
-               n.ZMODIFICATIONDATE1 AS modified, d.ZDATA AS data
+               n.ZMODIFICATIONDATE1 AS modified, d.ZDATA AS data,
+               COALESCE(fp.path, '') AS folder
         FROM ZICCLOUDSYNCINGOBJECT n
         JOIN ZICNOTEDATA d ON d.ZNOTE = n.Z_PK
-        WHERE n.ZTITLE1 IS NOT NULL AND n.ZMARKEDFORDELETION = 0
+        LEFT JOIN folder_path fp ON fp.id = n.ZFOLDER
+        WHERE n.ZTITLE1 IS NOT NULL AND n.ZMARKEDFORDELETION = 0 AND n.Z_ENT = 11
       `).all();
       return rows.map((r: any) => ({
         title: r.title as string,
         content: r.data ? extractText(r.data) : "",
         creation_date: r.created ? cfDate(r.created) : "",
         modification_date: r.modified ? cfDate(r.modified) : "",
+        folder: r.folder as string,
       }));
     } finally { db.close(); }
   } catch (err) { handleDbError(err); }
@@ -237,11 +337,14 @@ const getNoteDetailsByTitle = async (title: string) => {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
       const row = db.query<any, [string]>(`
+        ${FOLDER_CTE}
         SELECT n.ZTITLE1 AS title, n.ZCREATIONDATE1 AS created,
-               n.ZMODIFICATIONDATE1 AS modified, d.ZDATA AS data
+               n.ZMODIFICATIONDATE1 AS modified, d.ZDATA AS data,
+               COALESCE(fp.path, '') AS folder
         FROM ZICCLOUDSYNCINGOBJECT n
         JOIN ZICNOTEDATA d ON d.ZNOTE = n.Z_PK
-        WHERE n.ZTITLE1 = ? AND n.ZMARKEDFORDELETION = 0
+        LEFT JOIN folder_path fp ON fp.id = n.ZFOLDER
+        WHERE n.ZTITLE1 = ? AND n.ZMARKEDFORDELETION = 0 AND n.Z_ENT = 11
         LIMIT 1
       `).get(title);
       if (!row) return {} as any;
@@ -250,6 +353,7 @@ const getNoteDetailsByTitle = async (title: string) => {
         content: row.data ? extractText(row.data) : "",
         creation_date: row.created ? cfDate(row.created) : "",
         modification_date: row.modified ? cfDate(row.modified) : "",
+        folder: row.folder as string,
       };
     } finally { db.close(); }
   } catch (err) { handleDbError(err); }
@@ -359,20 +463,36 @@ export const indexNotes = async (
   await maybeSendProgress(extra, 0, overallTotal, `Embedding ${toIndex.length} notes…`);
   await maybeSendMessage(extra, `Embedding ${toIndex.length} notes…`);
 
-  // 6. Build chunks and convert HTML → Markdown
-  const chunks = toIndex.map((note, i) => ({
-    id: i.toString(),
-    title: note.title,
-    content: note.content,
-    creation_date: note.creation_date,
-    modification_date: note.modification_date,
-  }));
-  try {
-    const td = await getTurndown();
-    for (const chunk of chunks) {
-      try { chunk.content = td(chunk.content || ""); } catch { /* keep original */ }
-    }
-  } catch { /* ignore turndown load errors */ }
+  // 6. Build chunks: convert HTML → Markdown, then split large notes
+  const CHUNK_SIZE = 1500; // chars (~300 tokens)
+  const CHUNK_OVERLAP = 150;
+  const chunks: Array<{ id: string; title: string; content: string; creation_date: string; modification_date: string; folder: string }> = [];
+
+  let td: ((html: string) => string) | null = null;
+  try { td = await getTurndown(); } catch { /* ignore */ }
+
+  const { RecursiveCharacterTextSplitter } = await import("@langchain/textsplitters");
+  const splitter = new RecursiveCharacterTextSplitter({ chunkSize: CHUNK_SIZE, chunkOverlap: CHUNK_OVERLAP });
+
+  for (const note of toIndex) {
+    let text = note.content ?? "";
+    if (td) { try { text = td(text); } catch { /* keep original */ } }
+
+    const splits = text.length > CHUNK_SIZE
+      ? await splitter.splitText(text)
+      : [text];
+
+    splits.forEach((chunk, ci) => {
+      chunks.push({
+        id: `${note.title}::${ci}`,
+        title: note.title,
+        content: chunk,
+        creation_date: note.creation_date,
+        modification_date: note.modification_date,
+        folder: note.folder ?? "",
+      });
+    });
+  }
 
   // 7. Embed and write in batches, reporting ETA after first batch
   // Larger batches = more efficient ONNX matrix ops; scale with CPU count
@@ -486,6 +606,7 @@ const startIndexJob = async (notesTable: any) => {
   void (async () => {
     try {
       const result = await indexNotes(notesTable, undefined, job);
+      lastIndexedModDate = getNotesMaxModDate();
       updateJob(job, {
         status: "completed",
         finishedAt: Date.now(),
@@ -539,6 +660,7 @@ const startIndexJobLazy = async (tableName?: string) => {
       const { notesTable } = await createNotesTable(tableName);
       appendJobLog(job, "Database ready.");
       const result = await indexNotes(notesTable, undefined, job);
+      lastIndexedModDate = getNotesMaxModDate();
       updateJob(job, {
         status: "completed",
         finishedAt: Date.now(),
@@ -568,22 +690,100 @@ server.tool("create-note", CreateNoteSchema.shape, async ({ title, content }) =>
   return createTextResponse(`Created note "${title}" successfully.`);
 });
 
-server.tool("list-notes", {}, async () => {
-  const { notesTable } = await createNotesTable();
-  return createTextResponse(
-    `There are ${await notesTable.countRows()} notes in your Apple Notes database.`
-  );
+const ListNotesSchema = z.object({
+  folder: z.string().optional().describe("Filter by folder name (exact path segment)"),
+  modifiedAfter: z.string().optional().describe("ISO date string — only notes modified after this date"),
+  modifiedBefore: z.string().optional().describe("ISO date string — only notes modified before this date"),
+  limit: z.number().int().min(1).max(500).optional().describe("Max results (default 50)"),
+});
+
+server.tool("list-notes", ListNotesSchema.shape, async ({ folder, modifiedAfter, modifiedBefore, limit = 50 }) => {
+  try {
+    const db = new Database(NOTES_DB, { readonly: true });
+    try {
+      const afterCf = modifiedAfter ? (new Date(modifiedAfter).getTime() / 1000 - CF_EPOCH) : null;
+      const beforeCf = modifiedBefore ? (new Date(modifiedBefore).getTime() / 1000 - CF_EPOCH) : null;
+
+      const rows = db.query<any, []>(`
+        ${FOLDER_CTE}
+        SELECT n.ZTITLE1 AS title,
+               datetime(n.ZMODIFICATIONDATE1 + ${CF_EPOCH}, 'unixepoch') AS modified,
+               COALESCE(fp.path, '') AS folder
+        FROM ZICCLOUDSYNCINGOBJECT n
+        LEFT JOIN folder_path fp ON fp.id = n.ZFOLDER
+        WHERE n.Z_ENT = 11 AND n.ZTITLE1 IS NOT NULL AND n.ZMARKEDFORDELETION = 0
+          ${afterCf !== null ? `AND n.ZMODIFICATIONDATE1 > ${afterCf}` : ""}
+          ${beforeCf !== null ? `AND n.ZMODIFICATIONDATE1 < ${beforeCf}` : ""}
+        ORDER BY n.ZMODIFICATIONDATE1 DESC
+        LIMIT ${limit}
+      `).all();
+
+      const filtered = folder
+        ? rows.filter((r: any) => {
+            const p = r.folder as string;
+            return p === folder || p.startsWith(folder + "/") ||
+                   p.endsWith("/" + folder) || p.includes("/" + folder + "/");
+          })
+        : rows;
+
+      return createTextResponse(JSON.stringify(filtered));
+    } finally { db.close(); }
+  } catch (err) { handleDbError(err); }
 });
 
 server.tool("get-note", GetNoteSchema.shape, async ({ title }) => {
+  // Try exact match first, fall back to semantic search
   const note = await getNoteDetailsByTitle(title);
-  return createTextResponse(JSON.stringify(note));
+  if (note && note.title) return createTextResponse(JSON.stringify(note));
+
+  // Fuzzy fallback via search index
+  await syncReindexIfNeeded();
+  const { notesTable } = await createNotesTable();
+  const results = await searchAndCombineResults(notesTable, title, 1);
+  if (!results.length) return createTextResponse(JSON.stringify({ error: `No note found matching "${title}"` }));
+  const best = await getNoteDetailsByTitle(results[0].title);
+  return createTextResponse(JSON.stringify(best));
 });
 
-server.tool("search-notes", QueryNotesSchema.shape, async ({ query }) => {
+server.tool("update-note", UpdateNoteSchema.shape, async ({ title, content }) => {
+  const script = `
+    const app = Application('Notes');
+    const matches = app.notes.whose({name: ${JSON.stringify(title)}});
+    if (matches.length === 0) throw new Error('Note not found: ${title.replace(/'/g, "\\'")}');
+    matches[0].body = ${JSON.stringify(content)};
+  `;
+  try {
+    execSync(`osascript -l JavaScript -e ${JSON.stringify(script)}`);
+  } catch (err: any) {
+    return createTextResponse(JSON.stringify({ error: err.message }));
+  }
+  return createTextResponse(`Updated note "${title}".`);
+});
+
+server.tool("search-notes", QueryNotesSchema.shape, async ({ query, folder, modifiedAfter, modifiedBefore }) => {
+  await syncReindexIfNeeded();
   const { notesTable } = await createNotesTable();
-  const combinedResults = await searchAndCombineResults(notesTable, query);
+  const combinedResults = await searchAndCombineResults(notesTable, query, 20, folder, modifiedAfter, modifiedBefore);
   return createTextResponse(JSON.stringify(combinedResults));
+});
+
+server.tool("index-health", {}, async () => {
+  const maxMod = getNotesMaxModDate();
+  const totalNotes = (() => {
+    try {
+      const db = new Database(NOTES_DB, { readonly: true });
+      try {
+        return (db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = 11 AND ZMARKEDFORDELETION = 0").get()?.n ?? 0);
+      } finally { db.close(); }
+    } catch { return null; }
+  })();
+  return createTextResponse(JSON.stringify({
+    lastIndexedAt: lastIndexedModDate ? new Date((lastIndexedModDate + CF_EPOCH) * 1000).toISOString() : null,
+    currentMaxModDate: maxMod ? new Date((maxMod + CF_EPOCH) * 1000).toISOString() : null,
+    inSync: lastIndexedModDate !== null && maxMod !== null && maxMod <= lastIndexedModDate,
+    activeJob: isActiveIndexJob(),
+    totalNotesInApple: totalNotes,
+  }));
 });
 
 server.tool("index-notes-blocking", {}, async (_args, extra) => {
@@ -692,34 +892,46 @@ if (process.argv.includes("--stdio")) {
  * Search for notes by title or content using both vector and FTS search.
  * The results are combined using RRF
  */
+const TEMPORAL_RE = /\b(recent|latest|newest|last|today|this week|new|current)\b/i;
+
 export const searchAndCombineResults = async (
   notesTable: any,
   query: string,
-  limit = 20
+  limit = 20,
+  folder?: string,
+  modifiedAfter?: string,
+  modifiedBefore?: string,
 ) => {
+  const isTemporalQuery = TEMPORAL_RE.test(query);
+  const candidateLimit = Math.max(limit * 3, 60);
+
+  // Folder segment matcher — checks if `name` is an exact segment in the path
+  const matchesFolder = folder
+    ? (path: string) => {
+        const seg = folder;
+        return path === seg || path.startsWith(seg + "/") ||
+               path.endsWith("/" + seg) || path.includes("/" + seg + "/");
+      }
+    : null;
+
   const [vectorResults, ftsSearchResults] = await Promise.all([
-    (async () => {
-      const results = await notesTable
-        .search(query, "vector")
-        .limit(limit)
-        .toArray();
-      return results;
-    })(),
-    (async () => {
-      const results = await notesTable
-        .search(query, "fts", "content")
-        .limit(limit)
-        .toArray();
-      return results;
-    })(),
+    notesTable.search(query, "vector").limit(candidateLimit).toArray(),
+    notesTable.search(query, "fts", "content").limit(candidateLimit).toArray(),
   ]);
 
   const k = 60;
   const scores = new Map<string, number>();
 
+  // Store full content + folder + modification_date in side maps; key is title
+  const contentMap = new Map<string, string>();
+  const folderMap = new Map<string, string>();
+  const modDateMap = new Map<string, string>();
   const processResults = (results: any[], startRank: number) => {
     results.forEach((result, idx) => {
-      const key = `${result.title}::${result.content}`;
+      const key = result.title;
+      if (!contentMap.has(key)) contentMap.set(key, result.content ?? "");
+      if (!folderMap.has(key)) folderMap.set(key, result.folder ?? "");
+      if (!modDateMap.has(key)) modDateMap.set(key, result.modification_date ?? "");
       const score = 1 / (k + startRank + idx);
       scores.set(key, (scores.get(key) || 0) + score);
     });
@@ -728,13 +940,57 @@ export const searchAndCombineResults = async (
   processResults(vectorResults, 0);
   processResults(ftsSearchResults, 0);
 
+  // --- Re-ranking: multiplicative combination (IR best practice) ---
+  // final_score = rrf_score * title_boost * recency_decay^(recency_alpha)
+  // Relevance (RRF) stays primary; recency and title modulate but can't override.
+
+  const now = Date.now();
+  // Temporal queries: 1-day half-life, strong recency alpha.
+  // Normal queries: 90-day half-life, weak recency alpha (just a tiebreaker).
+  const HALF_LIFE_MS = isTemporalQuery ? 1 * 24 * 60 * 60 * 1000 : 90 * 24 * 60 * 60 * 1000;
+  const recencyAlpha = isTemporalQuery ? 0.7 : 0.1; // how much recency shifts the final score
+
+  const queryWords = query.toLowerCase().split(/\W+/).filter(w => w.length > 2);
+
+  for (const [title, rrf] of scores) {
+    // Title field boost: 2x per matching query word, capped at 3x total (standard Elasticsearch default)
+    const tl = title.toLowerCase();
+    const titleMatches = queryWords.filter(w => tl.includes(w)).length;
+    const titleBoost = Math.min(1 + titleMatches * 0.5, 3.0);
+
+    // Recency decay: [0, 1] — 1.0 = just modified, approaches 0 for old notes
+    const modDate = modDateMap.get(title);
+    const ageMs = modDate ? now - new Date(modDate).getTime() : Infinity;
+    const recencyDecay = Math.exp(-Math.LN2 * ageMs / HALF_LIFE_MS);
+
+    // Multiplicative blend: relevance * title * lerp(1, recencyDecay, alpha)
+    const recencyFactor = 1 - recencyAlpha + recencyAlpha * recencyDecay;
+    scores.set(title, rrf * titleBoost * recencyFactor);
+  }
+
+  const afterMs = modifiedAfter ? new Date(modifiedAfter).getTime() : null;
+  const beforeMs = modifiedBefore ? new Date(modifiedBefore).getTime() : null;
+
+  const SNIPPET_LEN = 300;
   const results = Array.from(scores.entries())
     .sort(([, a], [, b]) => b - a)
+    .filter(([title]) => {
+      if (matchesFolder && !matchesFolder(folderMap.get(title) ?? "")) return false;
+      const mod = modDateMap.get(title);
+      if (mod) {
+        const ms = new Date(mod).getTime();
+        if (afterMs !== null && ms < afterMs) return false;
+        if (beforeMs !== null && ms > beforeMs) return false;
+      }
+      return true;
+    })
     .slice(0, limit)
-    .map(([key]) => {
-      const [title, content] = key.split("::");
-      return { title, content };
-    });
+    .map(([title]) => ({
+      title,
+      folder: folderMap.get(title) ?? "",
+      modified: modDateMap.get(title) ?? "",
+      snippet: (contentMap.get(title) ?? "").slice(0, SNIPPET_LEN),
+    }));
 
   return results;
 };

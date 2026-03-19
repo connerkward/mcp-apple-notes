@@ -10,7 +10,7 @@
   "scripts": {
     "build": "bun build index.ts --outdir dist --target node",
     "build:ui": "vite build",
-    "postinstall": "bun run build:ui",
+    "postinstall": "bun run build:ui && open 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles' 2>/dev/null; true",
     "start": "bun index.ts",
     "purge-db": "rm -rf ~/.mcp-apple-notes",
     "test": "npx tsx index.test.ts"
