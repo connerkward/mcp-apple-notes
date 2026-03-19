@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Apple Notes Indexer</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "SF Pro Text", "SF Pro Display", Segoe UI, Roboto, Arial,
+          "Apple Color Emoji", "Segoe UI Emoji";
+        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+
+        --bg: #f2f2f7;
+        --paper: #ffffff;
+        --paper2: #fbfbfd;
+        --text: rgba(0, 0, 0, 0.88);
+        --muted: rgba(0, 0, 0, 0.55);
+        --border: rgba(60, 60, 67, 0.18);
+        --shadow: 0 18px 60px rgba(0, 0, 0, 0.12);
+        --radius: 16px;
+        --accent: #ffcc00;
+        --accent2: #ff9f0a;
+        --chrome: rgba(255, 255, 255, 0.76);
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #000000;
+          --paper: #1c1c1e;
+          --paper2: #2c2c2e;
+          --text: rgba(255, 255, 255, 0.92);
+          --muted: rgba(255, 255, 255, 0.66);
+          --border: rgba(84, 84, 88, 0.65);
+          --shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+          --chrome: rgba(28, 28, 30, 0.72);
+        }
+      }
+
+      body {
+        margin: 0;
+        font-family: var(--sans);
+        background: transparent;
+        color: var(--text);
+        padding: 0;
+      }
+
+      .card {
+        width: 100%;
+        background: linear-gradient(180deg, var(--paper), var(--paper2));
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        overflow: hidden;
+        box-sizing: border-box;
+      }
+
+      .header {
+        padding: 16px 16px 12px 16px;
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        border-bottom: 1px solid var(--border);
+        background: var(--chrome);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+      }
+
+      .title {
+        font-weight: 650;
+        letter-spacing: -0.02em;
+        font-size: 16px;
+      }
+
+      .subtitle {
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .body {
+        padding: 16px;
+        display: grid;
+        gap: 12px;
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .status {
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.4;
+      }
+
+      .pill {
+        font-family: var(--mono);
+        font-size: 12px;
+        padding: 6px 10px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        color: var(--muted);
+        background: color-mix(in srgb, var(--paper) 70%, transparent);
+      }
+
+      .barWrap {
+        height: 14px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        overflow: hidden;
+        position: relative;
+        background: color-mix(in srgb, var(--paper2) 70%, transparent);
+      }
+
+      .bar {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, var(--accent), var(--accent2));
+        transition: width 180ms ease;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+        justify-content: flex-end;
+      }
+
+      button {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: color-mix(in srgb, var(--paper2) 75%, transparent);
+        color: var(--text);
+        padding: 10px 12px;
+        border-radius: 10px;
+        font-weight: 650;
+        cursor: pointer;
+      }
+
+      button:hover {
+        background: color-mix(in srgb, var(--paper2) 65%, transparent);
+      }
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      .log {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 12px;
+        background: color-mix(in srgb, var(--paper2) 75%, transparent);
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--muted);
+        height: 100px;
+        overflow: auto;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="header">
+        <div class="title">Apple Notes indexing</div>
+        <div class="subtitle">MCP App UI</div>
+      </div>
+      <div class="body">
+        <div class="row">
+          <div class="status" id="status">Starting…</div>
+          <div class="pill" id="pill">—</div>
+        </div>
+        <div class="barWrap" aria-label="Progress">
+          <div class="bar" id="bar"></div>
+        </div>
+        <div class="controls">
+          <button id="retry" title="Start a new background index job">
+            Start / Retry
+          </button>
+          <button id="cancel" disabled>Cancel</button>
+        </div>
+        <div class="log" id="log" aria-label="Logs"></div>
+      </div>
+    </div>
+
+    <script type="module" src="./indexer-app.ts"></script>
+  </body>
+</html>
+

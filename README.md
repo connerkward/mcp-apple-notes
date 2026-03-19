@@ -35,6 +35,8 @@ cd mcp-apple-notes
 bun install
 ```
 
+3. After install, System Settings will open to **Full Disk Access** — add **Claude.app** there, then restart Claude Desktop.
+
 ## Usage
 
 1. Open Claude desktop app and go to Settings -> Developer -> Edit Config
@@ -46,9 +48,9 @@ bun install
 ```json
 {
   "mcpServers": {
-    "local-machine": {
+    "apple-notes": {
       "command": "/Users/<YOUR_USER_NAME>/.bun/bin/bun",
-      "args": ["/Users/<YOUR_USER_NAME>/apple-notes-mcp/index.ts"]
+      "args": ["/Users/<YOUR_USER_NAME>/mcp-apple-notes/index.ts", "--stdio"]
     }
   }
 }
@@ -60,14 +62,20 @@ Important: Replace `<YOUR_USER_NAME>` with your actual username.
 
 ![Claude MCP Connection Status](./images/verify_installation.png)
 
-4. Start by indexing your notes. Ask Claude to index your notes by saying something like: "Index my notes" or "Index my Apple Notes".
+5. Start by indexing your notes. Ask Claude to index your notes by saying something like: "Index my notes" or "Index my Apple Notes".
+
+## Indexing UI
+
+The `index-notes` tool opens an inline MCP App UI panel inside Claude Desktop showing a live progress bar, status, and log stream. Indexing runs in the background — it does not block the conversation. You can cancel an in-progress job from the UI at any time.
+
+The embedding model (`all-MiniLM-L6-v2`) is pre-warmed at server startup so it is ready before the first `index-notes` call.
 
 ## Troubleshooting
 
 To see logs:
 
 ```bash
-tail -n 50 -f ~/Library/Logs/Claude/mcp-server-local-machine.log
+tail -n 50 -f ~/Library/Logs/Claude/mcp-server-apple-notes.log
 # or
 tail -n 50 -f ~/Library/Logs/Claude/mcp.log
 ```

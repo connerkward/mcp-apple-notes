@@ -9,6 +9,8 @@
   "license": "ISC",
   "scripts": {
     "build": "bun build index.ts --outdir dist --target node",
+    "build:ui": "vite build",
+    "postinstall": "bun run build:ui",
     "start": "bun index.ts",
     "purge-db": "rm -rf ~/.mcp-apple-notes",
     "test": "npx tsx index.test.ts"
@@ -21,12 +23,15 @@
     "@huggingface/transformers": "^3.1.2",
     "@lancedb/lancedb": "^0.14.0",
     "@langchain/textsplitters": "^0.1.0",
-    "@modelcontextprotocol/sdk": "^1.0.3",
+    "@modelcontextprotocol/ext-apps": "^1.2.2",
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "run-jxa": "^3.0.0",
     "turndown": "^7.2.0",
-    "zod": "^3.24.1"
+    "zod": "^4"
   },
   "devDependencies": {
-    "@types/turndown": "^5.0.5"
+    "@types/turndown": "^5.0.5",
+    "vite": "^8.0.0",
+    "vite-plugin-singlefile": "^2.3.2"
   }
 }

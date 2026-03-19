@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MCP Progress Mock</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "SF Pro Text", "SF Pro Display", Segoe UI, Roboto, Arial,
+          "Apple Color Emoji", "Segoe UI Emoji";
+        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+
+        /* Apple Notes-ish light mode defaults */
+        --bg: #f2f2f7;
+        --paper: #ffffff;
+        --paper2: #fbfbfd;
+        --text: rgba(0, 0, 0, 0.88);
+        --muted: rgba(0, 0, 0, 0.55);
+        --border: rgba(60, 60, 67, 0.18);
+        --shadow: 0 24px 80px rgba(0, 0, 0, 0.12);
+        --radius: 16px;
+
+        --accent: #ffcc00; /* Notes yellow */
+        --accent2: #ff9f0a; /* iOS orange */
+        --chrome: rgba(255, 255, 255, 0.76);
+      }
+
+      @media (prefers-color-scheme: light) {
+        :root {
+          /* already light */
+        }
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #000000;
+          --paper: #1c1c1e;
+          --paper2: #2c2c2e;
+          --text: rgba(255, 255, 255, 0.92);
+          --muted: rgba(255, 255, 255, 0.66);
+          --border: rgba(84, 84, 88, 0.65);
+          --shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+          --chrome: rgba(28, 28, 30, 0.72);
+        }
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: var(--sans);
+        background: radial-gradient(
+            900px 520px at 20% 0%,
+            rgba(255, 204, 0, 0.18),
+            transparent 55%
+          ),
+          radial-gradient(
+            1000px 620px at 80% 10%,
+            rgba(255, 159, 10, 0.12),
+            transparent 55%
+          ),
+          var(--bg);
+        color: var(--text);
+        display: grid;
+        place-items: center;
+        padding: 28px;
+      }
+
+      .card {
+        width: min(760px, 100%);
+        background: linear-gradient(180deg, var(--paper), var(--paper2));
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+        overflow: hidden;
+      }
+
+      .header {
+        padding: 18px 18px 14px 18px;
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 12px;
+        border-bottom: 1px solid var(--border);
+        background: var(--chrome);
+        backdrop-filter: blur(14px);
+        -webkit-backdrop-filter: blur(14px);
+      }
+
+      .title {
+        font-weight: 650;
+        letter-spacing: -0.02em;
+        font-size: 16px;
+      }
+
+      .subtitle {
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .body {
+        padding: 18px;
+        display: grid;
+        gap: 14px;
+      }
+
+      .row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+      }
+
+      .status {
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.4;
+      }
+
+      .pill {
+        font-family: var(--mono);
+        font-size: 12px;
+        padding: 6px 10px;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        color: var(--muted);
+        background: color-mix(in srgb, var(--paper) 70%, transparent);
+      }
+
+      .barWrap {
+        height: 14px;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        overflow: hidden;
+        position: relative;
+        background: color-mix(in srgb, var(--paper2) 70%, transparent);
+      }
+
+      .bar {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, var(--accent), var(--accent2));
+        transition: width 180ms ease;
+      }
+
+      .controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: center;
+      }
+
+      button {
+        appearance: none;
+        border: 1px solid var(--border);
+        background: color-mix(in srgb, var(--paper2) 75%, transparent);
+        color: var(--text);
+        padding: 10px 12px;
+        border-radius: 10px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      button:hover {
+        background: color-mix(in srgb, var(--paper2) 65%, transparent);
+      }
+
+      button:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
+      }
+
+      label {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--muted);
+        font-family: var(--mono);
+        font-size: 12px;
+      }
+
+      input[type="number"] {
+        width: 92px;
+        padding: 10px 10px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: color-mix(in srgb, var(--paper2) 75%, transparent);
+        color: var(--text);
+        font-family: var(--mono);
+      }
+
+      .log {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 12px;
+        background: color-mix(in srgb, var(--paper2) 75%, transparent);
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--muted);
+        height: 180px;
+        overflow: auto;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="header">
+        <div class="title">MCP tool progress (mock)</div>
+        <div class="subtitle">Simulates `notifications/progress` updates</div>
+      </div>
+      <div class="body">
+        <div class="row">
+          <div class="status" id="status">Idle.</div>
+          <div class="pill" id="pill">0 / 0</div>
+        </div>
+
+        <div class="barWrap" aria-label="Progress">
+          <div class="bar" id="bar"></div>
+        </div>
+
+        <div class="controls">
+          <button id="start">Start mock index</button>
+          <button id="stop" disabled>Stop</button>
+          <label
+            >Notes:
+            <input id="total" type="number" min="1" max="5000" value="120" />
+          </label>
+          <label
+            >Tick (ms):
+            <input id="tick" type="number" min="10" max="2000" value="45" />
+          </label>
+        </div>
+
+        <div class="log" id="log" aria-label="Progress log"></div>
+      </div>
+    </div>
+
+    <script type="module" src="./mock.js"></script>
+  </body>
+</html>
+
