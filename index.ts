@@ -1130,10 +1130,20 @@ export const searchAndCombineResults = async (
     return [...queryVariants].some(v => text.includes(v));
   };
 
-  const [vectorResults, ftsContentResults, ftsTitleResults] = await Promise.all([
+  // Substring search: what Apple Notes does natively. Finds "AR-15" with variant "ar-15",
+  // "AR15" with variant "ar15". Runs in parallel with FTS/vector.
+  const substringConditions = [...queryVariants]
+    .flatMap(v => {
+      const esc = v.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      return [`lower(title) LIKE '%${esc}%'`, `lower(content) LIKE '%${esc}%'`];
+    })
+    .join(" OR ");
+
+  const [vectorResults, ftsContentResults, ftsTitleResults, substringResults] = await Promise.all([
     notesTable.search(query, "vector").limit(candidateLimit).toArray(),
     notesTable.search(query, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]),
     notesTable.search(query, "fts", "title").limit(candidateLimit).toArray().catch(() => [] as any[]),
+    notesTable.query().where(substringConditions).select(["title", "content", "folder", "modification_date"]).toArray().catch(() => [] as any[]),
   ]);
 
   const k = 60;
@@ -1164,6 +1174,7 @@ export const searchAndCombineResults = async (
   processResults(vectorResults);
   processResults(ftsContentResults, 1, true);  // filter garbage FTS results
   processResults(ftsTitleResults, 3, true);     // title match = 3× weight, filter garbage
+  processResults(substringResults, 2, false);   // exact substring match — high weight, no additional filter
 
   // --- Re-ranking: multiplicative combination (IR best practice) ---
   // final_score = rrf_score * title_boost * recency_decay^(recency_alpha)
