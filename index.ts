@@ -197,12 +197,13 @@ const syncReindexIfNeeded = async () => {
   lastIndexedModDate = getNotesMaxModDate();
 };
 
+const INDEXER_RESOURCE_URI = "ui://apple-notes/indexer.html";
+
+function createServer(): McpServer {
 const server = new McpServer({
   name: "my-apple-notes-mcp",
   version: "1.0.0",
 });
-
-const INDEXER_RESOURCE_URI = "ui://apple-notes/indexer.html";
 
 registerAppResource(
   server,
@@ -225,6 +226,9 @@ registerAppResource(
   }
 );
 
+registerTools(server);
+return server;
+} // end createServer
 
 const NOTES_DB = path.join(
   os.homedir(),
@@ -530,6 +534,9 @@ export const indexNotes = async (
     let text = note.content ?? "";
     if (td) { try { text = td(text); } catch { /* keep original */ } }
     text = filterContent(text);
+    // Normalize "AR-15" → "AR15": removes hyphens between letter-digit pairs so FTS
+    // indexes as a single token, matching queries like "ar15" directly.
+    text = text.replace(/\b([A-Za-z]+)-(\d+)\b/g, "$1$2").replace(/\b(\d+)-([A-Za-z]+)\b/g, "$1$2");
 
     const splits = text.length > CHUNK_SIZE
       ? await splitter.splitText(text)
@@ -737,6 +744,8 @@ const startIndexJobLazy = async (tableName?: string) => {
 
   return job.id;
 };
+
+function registerTools(server: McpServer) {
 
 server.tool("create-note", CreateNoteSchema.shape, async ({ title, content }) => {
   await createNote(title, content);
@@ -1037,12 +1046,15 @@ server.tool("cancel-index-notes", JobIdSchema.shape, async ({ jobId }) => {
   return createTextResponse(JSON.stringify({ jobId: job.id, cancelled: true }));
 });
 
+} // end registerTools
+
 // Start the server — only when run directly, not when imported by tests
 if (import.meta.main) {
 
 const PORT = parseInt(process.env.MCP_PORT ?? "3741");
 
 if (process.argv.includes("--stdio")) {
+  const server = createServer();
   await server.connect(new StdioServerTransport());
   console.error("MCP server running on stdio");
   // Pre-warm the ONNX model in the background so it's ready before the user calls index-notes
@@ -1050,15 +1062,17 @@ if (process.argv.includes("--stdio")) {
 } else {
   const httpServer = http.createServer(async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version");
+    res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
     if (req.url === "/mcp") {
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c));
       req.on("end", async () => {
         const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
-        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+        const server = createServer();
+        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
         res.on("close", () => { transport.close(); server.close(); });
         await server.connect(transport);
         await transport.handleRequest(req, res, body);
@@ -1101,16 +1115,20 @@ export const searchAndCombineResults = async (
       }
     : null;
 
-  // Normalize query for FTS: "AR-15" → "AR15", "wi-fi" → "wifi" so hyphenated
-  // and non-hyphenated variants match. Tantivy tokenizes on hyphens so "AR-15"
-  // indexes as ["ar","15"] but "AR15" indexes as ["ar15"] — they never intersect.
-  const ftsQuery = query.replace(/([a-zA-Z])-(\d)|(\d)-([a-zA-Z])|([a-zA-Z])-([a-zA-Z])/g,
-    (_, a, b, c, d, e, f) => (a && b) ? a+b : (c && d) ? c+d : e+f);
+  // FTS tokenization: tantivy splits on hyphens, so "AR-15" → ["ar","15"] but
+  // "AR15" → ["ar15"] — they never intersect. To match both we use:
+  //   1. Original query: catches content already normalized to "AR15"
+  //   2. Phrase query: '"ar 15"' → exact phrase ["ar","15"] → matches "AR-15" in content
+  // At index time we also normalize "AR-15" → "AR15" for future indexes.
+  const ftsPhrase = query.replace(/([a-zA-Z])(\d)/g, "$1 $2").replace(/(\d)([a-zA-Z])/g, "$1 $2");
+  const ftsPhraseQuery = ftsPhrase !== query ? `"${ftsPhrase}"` : null;
 
-  const [vectorResults, ftsContentResults, ftsTitleResults] = await Promise.all([
+  const [vectorResults, ftsContentResults, ftsTitleResults, ftsContentPhrase, ftsTitlePhrase] = await Promise.all([
     notesTable.search(query, "vector").limit(candidateLimit).toArray(),
-    notesTable.search(ftsQuery, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]),
-    notesTable.search(ftsQuery, "fts", "title").limit(candidateLimit).toArray().catch(() => [] as any[]),
+    notesTable.search(query, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]),
+    notesTable.search(query, "fts", "title").limit(candidateLimit).toArray().catch(() => [] as any[]),
+    ftsPhraseQuery ? notesTable.search(ftsPhraseQuery, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]) : Promise.resolve([] as any[]),
+    ftsPhraseQuery ? notesTable.search(ftsPhraseQuery, "fts", "title").limit(candidateLimit).toArray().catch(() => [] as any[]) : Promise.resolve([] as any[]),
   ]);
 
   const k = 60;
@@ -1120,9 +1138,16 @@ export const searchAndCombineResults = async (
   const contentMap = new Map<string, string>();
   const folderMap = new Map<string, string>();
   const modDateMap = new Map<string, string>();
+
+  // CRITICAL: deduplicate chunks per note within each result set.
+  // A chunky note (e.g. 10 chunks all in top-10) must not accumulate 10× score.
+  // Only the highest-ranked chunk (lowest idx) counts per note per result set.
   const processResults = (results: any[], weight = 1) => {
+    const seen = new Set<string>();
     results.forEach((result, idx) => {
       const key = result.title;
+      if (seen.has(key)) return;
+      seen.add(key);
       if (!contentMap.has(key)) contentMap.set(key, result.content ?? "");
       if (!folderMap.has(key)) folderMap.set(key, result.folder ?? "");
       if (!modDateMap.has(key)) modDateMap.set(key, result.modification_date ?? "");
@@ -1133,8 +1158,9 @@ export const searchAndCombineResults = async (
 
   processResults(vectorResults);
   processResults(ftsContentResults);
-  // Title FTS gets 2× weight — an exact keyword match in the title is very high signal
-  processResults(ftsTitleResults, 2);
+  processResults(ftsTitleResults, 2);  // title match = 2× weight
+  processResults(ftsContentPhrase);
+  processResults(ftsTitlePhrase, 2);
 
   // --- Re-ranking: multiplicative combination (IR best practice) ---
   // final_score = rrf_score * title_boost * recency_decay^(recency_alpha)
