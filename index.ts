@@ -1115,20 +1115,25 @@ export const searchAndCombineResults = async (
       }
     : null;
 
-  // FTS tokenization: tantivy splits on hyphens, so "AR-15" → ["ar","15"] but
-  // "AR15" → ["ar15"] — they never intersect. To match both we use:
-  //   1. Original query: catches content already normalized to "AR15"
-  //   2. Phrase query: '"ar 15"' → exact phrase ["ar","15"] → matches "AR-15" in content
-  // At index time we also normalize "AR-15" → "AR15" for future indexes.
-  const ftsPhrase = query.replace(/([a-zA-Z])(\d)/g, "$1 $2").replace(/(\d)([a-zA-Z])/g, "$1 $2");
-  const ftsPhraseQuery = ftsPhrase !== query ? `"${ftsPhrase}"` : null;
+  // Build query variants to match both "AR15" and "AR-15" in content:
+  //   - Original: matches content already normalized to "AR15"
+  //   - Hyphenated: "ar15" → "ar-15" matches content with "AR-15"
+  const queryL = query.toLowerCase();
+  const queryHyphenated = queryL.replace(/([a-zA-Z])(\d)/g, "$1-$2").replace(/(\d)([a-zA-Z])/g, "$1-$2");
+  const queryVariants = new Set([queryL, queryHyphenated,
+    queryL.replace(/([a-zA-Z])-(\d)/g, "$1$2").replace(/(\d)-([a-zA-Z])/g, "$1$2")]);
 
-  const [vectorResults, ftsContentResults, ftsTitleResults, ftsContentPhrase, ftsTitlePhrase] = await Promise.all([
+  // FTS returns garbage results when a query term has no index matches.
+  // Filter: only keep FTS results where the actual text contains the query (or a variant).
+  const isFtsRelevant = (r: any) => {
+    const text = (r.title + " " + r.content).toLowerCase();
+    return [...queryVariants].some(v => text.includes(v));
+  };
+
+  const [vectorResults, ftsContentResults, ftsTitleResults] = await Promise.all([
     notesTable.search(query, "vector").limit(candidateLimit).toArray(),
     notesTable.search(query, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]),
     notesTable.search(query, "fts", "title").limit(candidateLimit).toArray().catch(() => [] as any[]),
-    ftsPhraseQuery ? notesTable.search(ftsPhraseQuery, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]) : Promise.resolve([] as any[]),
-    ftsPhraseQuery ? notesTable.search(ftsPhraseQuery, "fts", "title").limit(candidateLimit).toArray().catch(() => [] as any[]) : Promise.resolve([] as any[]),
   ]);
 
   const k = 60;
@@ -1139,12 +1144,12 @@ export const searchAndCombineResults = async (
   const folderMap = new Map<string, string>();
   const modDateMap = new Map<string, string>();
 
-  // CRITICAL: deduplicate chunks per note within each result set.
-  // A chunky note (e.g. 10 chunks all in top-10) must not accumulate 10× score.
-  // Only the highest-ranked chunk (lowest idx) counts per note per result set.
-  const processResults = (results: any[], weight = 1) => {
+  // Deduplicate chunks per note within each result set so a chunky note can't
+  // accumulate 10× score. Only the highest-ranked chunk (lowest idx) counts.
+  const processResults = (results: any[], weight = 1, relevanceFilter = false) => {
     const seen = new Set<string>();
-    results.forEach((result, idx) => {
+    const filtered = relevanceFilter ? results.filter(isFtsRelevant) : results;
+    filtered.forEach((result, idx) => {
       const key = result.title;
       if (seen.has(key)) return;
       seen.add(key);
@@ -1157,10 +1162,8 @@ export const searchAndCombineResults = async (
   };
 
   processResults(vectorResults);
-  processResults(ftsContentResults);
-  processResults(ftsTitleResults, 2);  // title match = 2× weight
-  processResults(ftsContentPhrase);
-  processResults(ftsTitlePhrase, 2);
+  processResults(ftsContentResults, 1, true);  // filter garbage FTS results
+  processResults(ftsTitleResults, 3, true);     // title match = 3× weight, filter garbage
 
   // --- Re-ranking: multiplicative combination (IR best practice) ---
   // final_score = rrf_score * title_boost * recency_decay^(recency_alpha)
