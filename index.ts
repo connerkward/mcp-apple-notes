@@ -1130,8 +1130,8 @@ export const searchAndCombineResults = async (
     return [...queryVariants].some(v => text.includes(v));
   };
 
-  // Substring search: what Apple Notes does natively. Finds "AR-15" with variant "ar-15",
-  // "AR15" with variant "ar15". Runs in parallel with FTS/vector.
+  // Exact substring search: what Apple Notes does natively. Catches tokenization gaps
+  // (e.g. "AR-15" found by variant "ar-15", "AR15" found by variant "ar15").
   const substringConditions = [...queryVariants]
     .flatMap(v => {
       const esc = v.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -1139,11 +1139,19 @@ export const searchAndCombineResults = async (
     })
     .join(" OR ");
 
-  const [vectorResults, ftsContentResults, ftsTitleResults, substringResults] = await Promise.all([
+  // Fuzzy FTS: tantivy ~1 edit distance on terms ≥4 chars — catches typos.
+  // Phrase FTS: wrap multi-word queries in quotes for adjacency matching.
+  const words = queryL.split(/\s+/).filter(Boolean);
+  const fuzzyQuery = words.map(w => w.length >= 4 ? `${w}~1` : w).join(" ");
+  const phraseQuery = words.length > 1 ? `"${queryL}"` : null;
+
+  const [vectorResults, ftsContentResults, ftsTitleResults, substringResults, fuzzyResults, phraseResults] = await Promise.all([
     notesTable.search(query, "vector").limit(candidateLimit).toArray(),
     notesTable.search(query, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]),
     notesTable.search(query, "fts", "title").limit(candidateLimit).toArray().catch(() => [] as any[]),
     notesTable.query().where(substringConditions).select(["title", "content", "folder", "modification_date"]).toArray().catch(() => [] as any[]),
+    notesTable.search(fuzzyQuery, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]),
+    phraseQuery ? notesTable.search(phraseQuery, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]) : Promise.resolve([] as any[]),
   ]);
 
   const k = 60;
@@ -1172,9 +1180,11 @@ export const searchAndCombineResults = async (
   };
 
   processResults(vectorResults);
-  processResults(ftsContentResults, 1, true);  // filter garbage FTS results
-  processResults(ftsTitleResults, 3, true);     // title match = 3× weight, filter garbage
-  processResults(substringResults, 2, false);   // exact substring match — high weight, no additional filter
+  processResults(ftsContentResults, 1, true);   // filter garbage FTS results
+  processResults(ftsTitleResults, 3, true);      // title match = 3× weight, filter garbage
+  processResults(substringResults, 2, false);    // exact substring — high weight, catches tokenization gaps
+  processResults(fuzzyResults, 0.8, true);       // fuzzy ~1 edit distance — typo tolerance
+  processResults(phraseResults, 1.5, true);      // phrase match — exact adjacency for multi-word queries
 
   // --- Re-ranking: multiplicative combination (IR best practice) ---
   // final_score = rrf_score * title_boost * recency_decay^(recency_alpha)
