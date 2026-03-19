@@ -599,12 +599,12 @@ const createNotesTableInner = async (overrideName?: string) => {
     { mode: "create", existOk: true }
   );
   const indices = await notesTable.listIndices();
+  const lancedb = await import("@lancedb/lancedb");
   if (!indices.find((index: any) => index.name === "content_idx")) {
-    const lancedb = await import("@lancedb/lancedb");
-    await notesTable.createIndex("content", {
-      config: lancedb.Index.fts(),
-      replace: true,
-    });
+    await notesTable.createIndex("content", { config: lancedb.Index.fts(), replace: true });
+  }
+  if (!indices.find((index: any) => index.name === "title_idx")) {
+    await notesTable.createIndex("title", { config: lancedb.Index.fts(), replace: true });
   }
   return notesTable;
 };
@@ -1059,7 +1059,7 @@ if (process.argv.includes("--stdio")) {
       req.on("end", async () => {
         const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
-        res.on("close", () => transport.close());
+        res.on("close", () => { transport.close(); server.close(); });
         await server.connect(transport);
         await transport.handleRequest(req, res, body);
       });
@@ -1101,9 +1101,16 @@ export const searchAndCombineResults = async (
       }
     : null;
 
-  const [vectorResults, ftsSearchResults] = await Promise.all([
+  // Normalize query for FTS: "AR-15" → "AR15", "wi-fi" → "wifi" so hyphenated
+  // and non-hyphenated variants match. Tantivy tokenizes on hyphens so "AR-15"
+  // indexes as ["ar","15"] but "AR15" indexes as ["ar15"] — they never intersect.
+  const ftsQuery = query.replace(/([a-zA-Z])-(\d)|(\d)-([a-zA-Z])|([a-zA-Z])-([a-zA-Z])/g,
+    (_, a, b, c, d, e, f) => (a && b) ? a+b : (c && d) ? c+d : e+f);
+
+  const [vectorResults, ftsContentResults, ftsTitleResults] = await Promise.all([
     notesTable.search(query, "vector").limit(candidateLimit).toArray(),
-    notesTable.search(query, "fts", "content").limit(candidateLimit).toArray(),
+    notesTable.search(ftsQuery, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]),
+    notesTable.search(ftsQuery, "fts", "title").limit(candidateLimit).toArray().catch(() => [] as any[]),
   ]);
 
   const k = 60;
@@ -1113,19 +1120,21 @@ export const searchAndCombineResults = async (
   const contentMap = new Map<string, string>();
   const folderMap = new Map<string, string>();
   const modDateMap = new Map<string, string>();
-  const processResults = (results: any[], startRank: number) => {
+  const processResults = (results: any[], weight = 1) => {
     results.forEach((result, idx) => {
       const key = result.title;
       if (!contentMap.has(key)) contentMap.set(key, result.content ?? "");
       if (!folderMap.has(key)) folderMap.set(key, result.folder ?? "");
       if (!modDateMap.has(key)) modDateMap.set(key, result.modification_date ?? "");
-      const score = 1 / (k + startRank + idx);
+      const score = weight / (k + idx);
       scores.set(key, (scores.get(key) || 0) + score);
     });
   };
 
-  processResults(vectorResults, 0);
-  processResults(ftsSearchResults, 0);
+  processResults(vectorResults);
+  processResults(ftsContentResults);
+  // Title FTS gets 2× weight — an exact keyword match in the title is very high signal
+  processResults(ftsTitleResults, 2);
 
   // --- Re-ranking: multiplicative combination (IR best practice) ---
   // final_score = rrf_score * title_boost * recency_decay^(recency_alpha)
