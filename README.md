@@ -73,6 +73,7 @@ bun install
 |------|-------------|
 | `index-notes` | Background indexing with live progress UI |
 | `search-notes` | Semantic + FTS search; optional `folder`, `modifiedAfter`, `modifiedBefore` |
+| `find-notes` | Exact substring search (like Apple Notes built-in); optional `folder`, date range |
 | `get-note` | Full note by title; fuzzy fallback on no exact match |
 | `list-notes` | Notes sorted by recency; optional `folder`, date range, `limit` |
 | `list-folders` | All folders with note counts |

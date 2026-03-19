@@ -959,6 +959,63 @@ server.tool("search-notes", QueryNotesSchema.shape, async ({ query, folder, modi
   return createTextResponse(JSON.stringify(combinedResults));
 });
 
+server.tool("find-notes", QueryNotesSchema.shape, async ({ query, folder, modifiedAfter, modifiedBefore }) => {
+  await syncReindexIfNeeded();
+  const { notesTable } = await createNotesTable();
+
+  const queryL = query.toLowerCase();
+  const variants = [queryL];
+  // Also search hyphenated/de-hyphenated variants (e.g. "ar15" ↔ "ar-15")
+  const hyph = queryL.replace(/([a-zA-Z])(\d)/g, "$1-$2").replace(/(\d)([a-zA-Z])/g, "$1-$2");
+  const dehyph = queryL.replace(/([a-zA-Z])-(\d)/g, "$1$2").replace(/(\d)-([a-zA-Z])/g, "$1$2");
+  if (hyph !== queryL) variants.push(hyph);
+  if (dehyph !== queryL && dehyph !== hyph) variants.push(dehyph);
+
+  const conditions = variants
+    .flatMap(v => {
+      const esc = v.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+      return [`lower(title) LIKE '%${esc}%'`, `lower(content) LIKE '%${esc}%'`];
+    })
+    .join(" OR ");
+
+  const afterMs = modifiedAfter ? new Date(modifiedAfter).getTime() : null;
+  const beforeMs = modifiedBefore ? new Date(modifiedBefore).getTime() : null;
+
+  const rows = await notesTable.query()
+    .where(conditions)
+    .select(["title", "content", "folder", "modification_date"])
+    .toArray()
+    .catch(() => [] as any[]);
+
+  // Deduplicate by title (multiple chunks per note), apply filters, build snippets
+  const seen = new Set<string>();
+  const results: any[] = [];
+  for (const row of rows) {
+    if (seen.has(row.title)) continue;
+    seen.add(row.title);
+    if (folder) {
+      const p = row.folder ?? "";
+      if (!(p === folder || p.startsWith(folder + "/") || p.endsWith("/" + folder) || p.includes("/" + folder + "/"))) continue;
+    }
+    if (afterMs || beforeMs) {
+      const ms = row.modification_date ? new Date(row.modification_date).getTime() : null;
+      if (ms !== null) {
+        if (afterMs && ms < afterMs) continue;
+        if (beforeMs && ms > beforeMs) continue;
+      }
+    }
+    const content = (row.content ?? "").toLowerCase();
+    const matchVariant = variants.find(v => content.includes(v) || row.title.toLowerCase().includes(v)) ?? queryL;
+    const idx = content.indexOf(matchVariant);
+    const snippet = idx >= 0
+      ? row.content.slice(Math.max(0, idx - 60), idx + 240).trim()
+      : row.content.slice(0, 300).trim();
+    results.push({ title: row.title, folder: row.folder, modification_date: row.modification_date, snippet });
+  }
+
+  return createTextResponse(JSON.stringify(results));
+});
+
 server.tool("index-health", {}, async () => {
   const maxMod = getNotesMaxModDate();
   const totalNotes = (() => {
