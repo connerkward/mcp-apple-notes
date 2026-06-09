@@ -175,7 +175,7 @@ const getNotesMaxModDate = (): number | null => {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
       const row = db.query<{ d: number | null }, []>(
-        "SELECT MAX(ZMODIFICATIONDATE1) AS d FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = 11 AND ZMARKEDFORDELETION = 0"
+        `SELECT MAX(ZMODIFICATIONDATE1) AS d FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = ${noteEnt(db)} AND ZMARKEDFORDELETION = 0`
       ).get();
       return row?.d ?? null;
     } finally { db.close(); }
@@ -250,6 +250,21 @@ const NOTES_DB = path.join(
 // CoreData timestamps: seconds since 2001-01-01
 const CF_EPOCH = 978307200;
 const cfDate = (cf: number) => new Date((cf + CF_EPOCH) * 1000).toISOString();
+
+// Z_ENT entity numbers are NOT stable across Notes.app/macOS schema versions
+// (ICNote was 11 on older builds, 12 on newer; ICFolder 14 → 15). They depend on
+// the order entities were added to the Core Data model. Resolve them from
+// Z_PRIMARYKEY at runtime — hardcoding silently matches the wrong entity
+// (ICMedia/ICAccount on this build) and returns zero notes.
+export function entId(db: Database, name: string): number {
+  const row = db
+    .query<{ e: number }, [string]>("SELECT Z_ENT AS e FROM Z_PRIMARYKEY WHERE Z_NAME = ?")
+    .get(name);
+  if (!row) throw new Error(`Entity "${name}" not found in Z_PRIMARYKEY`);
+  return row.e;
+}
+export const noteEnt = (db: Database) => entId(db, "ICNote");
+export const folderEnt = (db: Database) => entId(db, "ICFolder");
 
 // Safe escaping for LanceDB filter strings (Arrow SQL syntax)
 export function escapeForFilter(s: string): string {
@@ -362,32 +377,35 @@ function handleDbError(err: unknown): never {
   throw err;
 }
 
-const FOLDER_CTE = `
+export const folderCte = (db: Database) => {
+  const fe = folderEnt(db);
+  return `
   WITH RECURSIVE folder_path(id, path) AS (
     SELECT Z_PK, ZTITLE2
     FROM ZICCLOUDSYNCINGOBJECT
-    WHERE Z_ENT = 14 AND ZPARENT IS NULL AND ZTITLE2 IS NOT NULL
+    WHERE Z_ENT = ${fe} AND ZPARENT IS NULL AND ZTITLE2 IS NOT NULL
     UNION ALL
     SELECT f.Z_PK, fp.path || '/' || f.ZTITLE2
     FROM ZICCLOUDSYNCINGOBJECT f
     JOIN folder_path fp ON f.ZPARENT = fp.id
-    WHERE f.Z_ENT = 14 AND f.ZTITLE2 IS NOT NULL
+    WHERE f.Z_ENT = ${fe} AND f.ZTITLE2 IS NOT NULL
   )
 `;
+};
 
 const getAllNoteDetails = async () => {
   try {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
       const rows = db.query<any, []>(`
-        ${FOLDER_CTE}
+        ${folderCte(db)}
         SELECT n.ZTITLE1 AS title, n.ZCREATIONDATE1 AS created,
                n.ZMODIFICATIONDATE1 AS modified, d.ZDATA AS data,
                COALESCE(fp.path, '') AS folder
         FROM ZICCLOUDSYNCINGOBJECT n
         JOIN ZICNOTEDATA d ON d.ZNOTE = n.Z_PK
         LEFT JOIN folder_path fp ON fp.id = n.ZFOLDER
-        WHERE n.ZTITLE1 IS NOT NULL AND n.ZMARKEDFORDELETION = 0 AND n.Z_ENT = 11
+        WHERE n.ZTITLE1 IS NOT NULL AND n.ZMARKEDFORDELETION = 0 AND n.Z_ENT = ${noteEnt(db)}
       `).all();
       return rows.map((r: any) => ({
         title: r.title as string,
@@ -405,14 +423,14 @@ const getNoteDetailsByTitle = async (title: string) => {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
       const row = db.query<any, [string]>(`
-        ${FOLDER_CTE}
+        ${folderCte(db)}
         SELECT n.ZTITLE1 AS title, n.ZCREATIONDATE1 AS created,
                n.ZMODIFICATIONDATE1 AS modified, d.ZDATA AS data,
                COALESCE(fp.path, '') AS folder
         FROM ZICCLOUDSYNCINGOBJECT n
         JOIN ZICNOTEDATA d ON d.ZNOTE = n.Z_PK
         LEFT JOIN folder_path fp ON fp.id = n.ZFOLDER
-        WHERE n.ZTITLE1 = ? AND n.ZMARKEDFORDELETION = 0 AND n.Z_ENT = 11
+        WHERE n.ZTITLE1 = ? AND n.ZMARKEDFORDELETION = 0 AND n.Z_ENT = ${noteEnt(db)}
         LIMIT 1
       `).get(title);
       if (!row) return {} as any;
@@ -779,13 +797,13 @@ server.tool("list-notes", ListNotesSchema.shape, async ({ folder, modifiedAfter,
       const beforeCf = modifiedBefore ? (new Date(modifiedBefore).getTime() / 1000 - CF_EPOCH) : null;
 
       const rows = db.query<any, []>(`
-        ${FOLDER_CTE}
+        ${folderCte(db)}
         SELECT n.ZTITLE1 AS title,
                datetime(n.ZMODIFICATIONDATE1 + ${CF_EPOCH}, 'unixepoch') AS modified,
                COALESCE(fp.path, '') AS folder
         FROM ZICCLOUDSYNCINGOBJECT n
         LEFT JOIN folder_path fp ON fp.id = n.ZFOLDER
-        WHERE n.Z_ENT = 11 AND n.ZTITLE1 IS NOT NULL AND n.ZMARKEDFORDELETION = 0
+        WHERE n.Z_ENT = ${noteEnt(db)} AND n.ZTITLE1 IS NOT NULL AND n.ZMARKEDFORDELETION = 0
           ${afterCf !== null ? `AND n.ZMODIFICATIONDATE1 > ${afterCf}` : ""}
           ${beforeCf !== null ? `AND n.ZMODIFICATIONDATE1 < ${beforeCf}` : ""}
         ORDER BY n.ZMODIFICATIONDATE1 DESC
@@ -839,10 +857,10 @@ server.tool("list-folders", {}, async () => {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
       const rows = db.query<{ path: string; noteCount: number }, []>(`
-        ${FOLDER_CTE}
+        ${folderCte(db)}
         SELECT fp.path, COUNT(n.Z_PK) AS noteCount
         FROM folder_path fp
-        LEFT JOIN ZICCLOUDSYNCINGOBJECT n ON n.ZFOLDER = fp.id AND n.Z_ENT = 11 AND n.ZMARKEDFORDELETION = 0
+        LEFT JOIN ZICCLOUDSYNCINGOBJECT n ON n.ZFOLDER = fp.id AND n.Z_ENT = ${noteEnt(db)} AND n.ZMARKEDFORDELETION = 0
         GROUP BY fp.id, fp.path
         ORDER BY fp.path
       `).all();
@@ -950,7 +968,7 @@ server.tool("check-changes", {}, async () => {
       const db = new Database(NOTES_DB, { readonly: true });
       try {
         const row = db.query<{ n: number }, [number]>(
-          "SELECT COUNT(*) AS n FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = 11 AND ZMARKEDFORDELETION = 0 AND ZMODIFICATIONDATE1 > ?"
+          `SELECT COUNT(*) AS n FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = ${noteEnt(db)} AND ZMARKEDFORDELETION = 0 AND ZMODIFICATIONDATE1 > ?`
         ).get(lastIndexedModDate);
         changedCount = row?.n ?? 0;
       } finally { db.close(); }
@@ -1034,7 +1052,7 @@ server.tool("index-health", {}, async () => {
     try {
       const db = new Database(NOTES_DB, { readonly: true });
       try {
-        return (db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = 11 AND ZMARKEDFORDELETION = 0").get()?.n ?? 0);
+        return (db.query<{ n: number }, []>(`SELECT COUNT(*) AS n FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = ${noteEnt(db)} AND ZMARKEDFORDELETION = 0`).get()?.n ?? 0);
       } finally { db.close(); }
     } catch { return null; }
   })();

@@ -19,6 +19,8 @@ import {
   createNotesTable,
   indexNotes,
   searchAndCombineResults,
+  noteEnt,
+  folderCte,
 } from "./index";
 
 const NOTES_DB = path.join(
@@ -27,18 +29,6 @@ const NOTES_DB = path.join(
 );
 
 const CF_EPOCH = 978307200;
-const FOLDER_CTE = `
-  WITH RECURSIVE folder_path(id, path) AS (
-    SELECT Z_PK, ZTITLE2
-    FROM ZICCLOUDSYNCINGOBJECT
-    WHERE Z_ENT = 14 AND ZPARENT IS NULL AND ZTITLE2 IS NOT NULL
-    UNION ALL
-    SELECT f.Z_PK, fp.path || '/' || f.ZTITLE2
-    FROM ZICCLOUDSYNCINGOBJECT f
-    JOIN folder_path fp ON f.ZPARENT = fp.id
-    WHERE f.Z_ENT = 14 AND f.ZTITLE2 IS NOT NULL
-  )
-`;
 
 // ─── Unit tests ───────────────────────────────────────────────────────────────
 
@@ -157,10 +147,10 @@ describe("SQLite — list-folders", () => {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
       const rows = db.query<{ path: string; noteCount: number }, []>(`
-        ${FOLDER_CTE}
+        ${folderCte(db)}
         SELECT fp.path, COUNT(n.Z_PK) AS noteCount
         FROM folder_path fp
-        LEFT JOIN ZICCLOUDSYNCINGOBJECT n ON n.ZFOLDER = fp.id AND n.Z_ENT = 11 AND n.ZMARKEDFORDELETION = 0
+        LEFT JOIN ZICCLOUDSYNCINGOBJECT n ON n.ZFOLDER = fp.id AND n.Z_ENT = ${noteEnt(db)} AND n.ZMARKEDFORDELETION = 0
         GROUP BY fp.id, fp.path
         ORDER BY fp.path
       `).all();
@@ -177,13 +167,13 @@ describe("SQLite — list-notes", () => {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
       const rows = db.query<any, []>(`
-        ${FOLDER_CTE}
+        ${folderCte(db)}
         SELECT n.ZTITLE1 AS title,
                datetime(n.ZMODIFICATIONDATE1 + ${CF_EPOCH}, 'unixepoch') AS modified,
                COALESCE(fp.path, '') AS folder
         FROM ZICCLOUDSYNCINGOBJECT n
         LEFT JOIN folder_path fp ON fp.id = n.ZFOLDER
-        WHERE n.Z_ENT = 11 AND n.ZTITLE1 IS NOT NULL AND n.ZMARKEDFORDELETION = 0
+        WHERE n.Z_ENT = ${noteEnt(db)} AND n.ZTITLE1 IS NOT NULL AND n.ZMARKEDFORDELETION = 0
         ORDER BY n.ZMODIFICATIONDATE1 DESC LIMIT 10
       `).all();
       expect(rows.length).toBeGreaterThan(0);
@@ -200,7 +190,7 @@ describe("SQLite — check-changes logic", () => {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
       const row = db.query<{ d: number | null }, []>(
-        "SELECT MAX(ZMODIFICATIONDATE1) AS d FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = 11 AND ZMARKEDFORDELETION = 0"
+        `SELECT MAX(ZMODIFICATIONDATE1) AS d FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = ${noteEnt(db)} AND ZMARKEDFORDELETION = 0`
       ).get();
       expect(row).not.toBeNull();
       expect(typeof row!.d).toBe("number");
@@ -215,7 +205,7 @@ describe("SQLite — note count", () => {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
       const row = db.query<{ n: number }, []>(
-        "SELECT COUNT(*) AS n FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = 11 AND ZMARKEDFORDELETION = 0"
+        `SELECT COUNT(*) AS n FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = ${noteEnt(db)} AND ZMARKEDFORDELETION = 0`
       ).get();
       expect(row!.n).toBeGreaterThan(0);
       console.log(`  Total notes: ${row!.n}`);
@@ -267,9 +257,9 @@ describe("LanceDB index — search", () => {
     let folderName = "";
     try {
       const row = db.query<{ path: string }, []>(`
-        ${FOLDER_CTE}
+        ${folderCte(db)}
         SELECT fp.path FROM folder_path fp
-        JOIN ZICCLOUDSYNCINGOBJECT n ON n.ZFOLDER = fp.id AND n.Z_ENT = 11 AND n.ZMARKEDFORDELETION = 0
+        JOIN ZICCLOUDSYNCINGOBJECT n ON n.ZFOLDER = fp.id AND n.Z_ENT = ${noteEnt(db)} AND n.ZMARKEDFORDELETION = 0
         GROUP BY fp.path HAVING COUNT(*) > 2 LIMIT 1
       `).get();
       folderName = row?.path?.split("/").pop() ?? "";
