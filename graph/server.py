@@ -1,87 +1,66 @@
-"""Read-only graph query sidecar for the Apple Notes Graphiti/Kuzu knowledge graph.
+"""Read-only graph query sidecar for the Apple Notes knowledge graph (FalkorDB).
 
-The notes UI (Bun) auto-spawns this and proxies /api/related to it. Kuzu is strictly
-single-process, so this holds ONE read_only connection for its whole life and the UI
-must be the only reader. No LLM / API key needed — pure Cypher.
+The notes UI (Bun) auto-spawns this and proxies /api/related to it. FalkorDB is a
+server (Redis-based) so concurrent reads are fine — no single-process constraint.
+Pure Cypher, no LLM / API key needed.
 
 Config (env):
-  GRAPH_DB    path to the .kuzu file   (default: ~/dev/exp-notes-indexing/graphiti_notes.kuzu)
-  GRAPH_PORT  port to listen on        (default: 3743)
+  FALKOR_HOST  default localhost
+  FALKOR_PORT  default 6379
+  FALKOR_DB    graph name, default "notes"
+  GRAPH_PORT   HTTP port to listen on, default 3743
 
-Schema (graphiti-core + Kuzu): notes are :Episodic {name=title, content=body},
-linked to :Entity via MENTIONS; entities link via RELATES_TO -> :RelatesToNode_ -> RELATES_TO.
+Schema (graphiti-core): notes are :Episodic {name=title}, linked to :Entity via
+MENTIONS; entities link to each other via RELATES_TO.
 """
 import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-import kuzu
+from falkordb import FalkorDB
 
-DB_PATH = os.environ.get("GRAPH_DB") or str(Path.home() / "dev/exp-notes-indexing/graphiti_notes.kuzu")
 PORT = int(os.environ.get("GRAPH_PORT", "3743"))
-
-if not Path(DB_PATH).exists():
-    raise SystemExit(f"graph DB not found: {DB_PATH}")
-
-# one read-only connection for the process lifetime (Kuzu is single-process)
-_conn = kuzu.Connection(kuzu.Database(DB_PATH, read_only=True))
+_db = FalkorDB(host=os.environ.get("FALKOR_HOST", "localhost"),
+               port=int(os.environ.get("FALKOR_PORT", "6379")))
+_g = _db.select_graph(os.environ.get("FALKOR_DB", "notes"))
 
 
-def _rows(res):
-    out = []
-    while res.has_next():
-        out.append(res.get_next())
-    return out
+def q(cypher, params=None):
+    return _g.query(cypher, params or {}).result_set
 
 
 def related_notes(title, limit=15):
-    # exact title match first
-    q = """
-    MATCH (src:Episodic {name: $title})-[:MENTIONS]->(e1:Entity)
-    OPTIONAL MATCH (e1)-[:RELATES_TO]->(:RelatesToNode_)-[:RELATES_TO]->(e2:Entity)
-    WITH src, collect(DISTINCT e1.uuid) + collect(DISTINCT e2.uuid) AS ents
-    UNWIND ents AS euid
-    MATCH (other:Episodic)-[:MENTIONS]->(e:Entity {uuid: euid})
-    WHERE other.uuid <> src.uuid
-    RETURN other.name AS note, count(DISTINCT e) AS shared
-    ORDER BY shared DESC LIMIT $limit
-    """
-    rows = _rows(_conn.execute(q, {"title": title, "limit": limit}))
-    return [{"note": n, "shared": s} for n, s in rows]
+    rows = q(
+        "MATCH (src:Episodic {name:$t})-[:MENTIONS]->(e:Entity)<-[:MENTIONS]-(other:Episodic) "
+        "WHERE other.name <> src.name "
+        "RETURN other.name AS note, count(DISTINCT e) AS shared ORDER BY shared DESC LIMIT $l",
+        {"t": title, "l": limit})
+    return [{"note": r[0], "shared": r[1]} for r in rows]
 
 
 def notes_for_entity(name, limit=15):
-    q = """
-    MATCH (e:Entity {name: $name})
-    OPTIONAL MATCH (e)-[:RELATES_TO]->(:RelatesToNode_)-[:RELATES_TO]->(nb:Entity)
-    WITH collect(DISTINCT e.uuid) + collect(DISTINCT nb.uuid) AS ents
-    UNWIND ents AS euid
-    MATCH (note:Episodic)-[:MENTIONS]->(x:Entity {uuid: euid})
-    RETURN note.name AS note, count(DISTINCT x) AS hits
-    ORDER BY hits DESC LIMIT $limit
-    """
-    rows = _rows(_conn.execute(q, {"name": name, "limit": limit}))
-    return [{"note": n, "hits": h} for n, h in rows]
+    rows = q(
+        "MATCH (e:Entity)<-[:MENTIONS]-(note:Episodic) WHERE e.name = $n "
+        "RETURN note.name AS note, count(e) AS hits ORDER BY hits DESC LIMIT $l",
+        {"n": name, "l": limit})
+    return [{"note": r[0], "hits": r[1]} for r in rows]
 
 
 def entities_in_note(title, limit=20):
-    q = """
-    MATCH (:Episodic {name: $title})-[:MENTIONS]->(e:Entity)
-    RETURN e.name AS name LIMIT $limit
-    """
-    return [r[0] for r in _rows(_conn.execute(q, {"title": title, "limit": limit}))]
+    rows = q("MATCH (:Episodic {name:$t})-[:MENTIONS]->(e:Entity) RETURN e.name LIMIT $l",
+             {"t": title, "l": limit})
+    return [r[0] for r in rows]
 
 
 def health():
-    def c(q):
+    def c(cypher):
         try:
-            return _rows(_conn.execute(q))[0][0]
+            return q(cypher)[0][0]
         except Exception:
             return 0
     return {
-        "ok": True, "db": DB_PATH,
+        "ok": True, "backend": "falkordb",
         "episodes": c("MATCH (e:Episodic) RETURN count(e)"),
         "entities": c("MATCH (n:Entity) RETURN count(n)"),
         "edges": c("MATCH ()-[r:RELATES_TO]->() RETURN count(r)"),
@@ -89,7 +68,7 @@ def health():
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a):  # quiet
+    def log_message(self, *a):
         pass
 
     def _send(self, code, obj):
@@ -119,5 +98,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"graph sidecar on http://127.0.0.1:{PORT} (db={DB_PATH})", flush=True)
+    print(f"graph sidecar (falkordb) on http://127.0.0.1:{PORT}", flush=True)
     HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

@@ -17,17 +17,16 @@ import { spawn } from "node:child_process";
 // read-only Python sidecar (Kuzu is single-process); we auto-spawn it if the graph
 // exists and proxy /api/related to it. Graph QUERIES need no LLM/key.
 const GRAPH_PORT = process.env.GRAPH_PORT || "3743";
-const GRAPH_DB = process.env.GRAPH_DB || path.join(os.homedir(), "dev", "exp-notes-indexing", "graphiti_notes.kuzu");
 const GRAPH_PY = process.env.GRAPH_PY || path.join(os.homedir(), "dev", "exp-notes-indexing", ".venv", "bin", "python");
 let graphUp = false;
 const startGraphSidecar = () => {
   const fsmod = require("node:fs");
-  if (!fsmod.existsSync(GRAPH_DB) || !fsmod.existsSync(GRAPH_PY)) {
-    console.error(`Graph sidecar skipped (no graph DB or python at ${GRAPH_DB} / ${GRAPH_PY}).`);
+  if (!fsmod.existsSync(GRAPH_PY)) {
+    console.error(`Graph sidecar skipped (no python with falkordb at ${GRAPH_PY}).`);
     return;
   }
   const proc = spawn(GRAPH_PY, [path.join(import.meta.dirname, "graph", "server.py")], {
-    env: { ...process.env, GRAPH_DB, GRAPH_PORT },
+    env: { ...process.env, GRAPH_PORT },
     stdio: ["ignore", "pipe", "pipe"],
   });
   proc.stdout.on("data", (d) => console.error(`[graph] ${d}`.trim()));
