@@ -10,6 +10,31 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import http from "node:http";
 import { computeClusters } from "./clustering";
+import { synthesize } from "./synthesize";
+
+// LLM config for synthesis (optional). Read once; key is never logged.
+// Works with a LOCAL OpenAI-compatible server (LM Studio / Ollama) or real OpenAI:
+//   SYNTH_BASE_URL   default https://api.openai.com/v1
+//                    LM Studio: http://localhost:1234/v1 · Ollama: http://localhost:11434/v1
+//   SYNTH_MODEL      default gpt-4o-mini
+//   OPENAI_API_KEY   from env or ~/dev/central/.env (any non-empty string for local servers)
+let _llm: { key: string; baseURL: string; model: string } | null | undefined;
+const getLlmConfig = () => {
+  if (_llm !== undefined) return _llm;
+  let key = process.env.OPENAI_API_KEY?.trim() || "";
+  if (!key) {
+    try {
+      const env = require("node:fs").readFileSync(path.join(os.homedir(), "dev", "central", ".env"), "utf8");
+      key = env.match(/^OPENAI_API_KEY=(.+)$/m)?.[1]?.trim() || "";
+    } catch {}
+  }
+  _llm = key ? {
+    key,
+    baseURL: process.env.SYNTH_BASE_URL?.trim() || "https://api.openai.com/v1",
+    model: process.env.SYNTH_MODEL?.trim() || "gpt-4o-mini",
+  } : null;
+  return _llm;
+};
 import {
   registerAppResource,
   registerAppTool,
@@ -1199,6 +1224,24 @@ if (process.argv.includes("--stdio")) {
         sendJson(200, { results, ms: Math.round(performance.now() - t0) });
       } catch (e: any) {
         sendJson(500, { error: String(e?.message ?? e), results: [] });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/synthesize") {
+      const q = (u.searchParams.get("q") ?? "").trim();
+      if (!q) { sendJson(400, { error: "missing q" }); return; }
+      const llm = getLlmConfig();
+      if (!llm) { sendJson(503, { error: "synthesis unavailable: no OPENAI_API_KEY (set it in env or ~/dev/central/.env)" }); return; }
+      try {
+        const { notesTable } = await createNotesTable();
+        const extractor = await getExtractor();
+        const embedOne = async (s: string) => Array.from((await extractor(s, { pooling: "mean", normalize: true })).data) as number[];
+        const embedBatch = async (arr: string[]) => (await extractor(arr, { pooling: "mean", normalize: true })).tolist() as number[][];
+        const result = await synthesize({ table: notesTable, topic: q, embedOne, embedBatch, apiKey: llm.key, baseURL: llm.baseURL, model: llm.model });
+        sendJson(200, result);
+      } catch (e: any) {
+        sendJson(500, { error: String(e?.message ?? e) });
       }
       return;
     }

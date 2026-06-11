@@ -97,6 +97,28 @@
   .legend .row .ct { color:var(--mut); font-size:11px; }
   .mapctl { display:flex; align-items:center; gap:8px; padding:8px 14px; color:var(--mut); font-size:12px; }
   .mapctl input[type=range] { accent-color:var(--accent); }
+
+  /* synthesize view */
+  #synthView { flex:1 1 auto; display:none; flex-direction:column; min-height:0; }
+  #synthView.on { display:flex; }
+  .synthbar { display:flex; gap:10px; padding:18px 24px 6px; max-width:920px; width:100%; margin:0 auto; }
+  #synthQ { flex:1 1 auto; font:16px var(--sans); color:var(--fg); background:var(--card);
+            border:1px solid var(--line); border-radius:10px; padding:12px 14px; outline:none; }
+  #synthQ:focus { border-color:var(--accent); }
+  .synthwrap { max-width:920px; margin:0 auto; }
+  .synthout { font:16px/1.7 var(--serif); white-space:pre-wrap; margin:18px 0 8px; }
+  .synthout .cite { color:var(--accent); cursor:pointer; font-family:var(--sans); font-size:12px;
+                    vertical-align:super; text-decoration:none; }
+  .synthout .note { font:13px var(--sans); color:var(--mut); font-style:italic; margin-bottom:14px; }
+  .synthsources { border-top:1px solid var(--line); padding-top:12px; margin-top:8px; }
+  .synthsources h3 { font:italic 400 15px/1 var(--serif); color:var(--mut); margin:0 0 8px; }
+  .src { display:flex; gap:10px; padding:7px 8px; border-radius:8px; font-size:13px; scroll-margin-top:80px; }
+  .src:target { background:var(--paper); }
+  .src .num { color:var(--accent); font-weight:600; flex:0 0 auto; }
+  .src .body { flex:1 1 auto; min-width:0; }
+  .src .t { font-weight:600; }
+  .src .m { color:var(--mut); font-size:11px; }
+  .src .x { color:var(--mut); font-size:12px; opacity:.85; }
 </style>
 </head>
 <body>
@@ -105,6 +127,7 @@
     <div class="nav">
       <button id="tabSearch" class="on">search</button>
       <button id="tabMap">map</button>
+      <button id="tabSynth">synthesize</button>
     </div>
     <div class="sp"></div>
     <span id="status">loading…</span>
@@ -142,6 +165,19 @@
       <h3>topics</h3>
       <div id="legendRows"></div>
     </div>
+  </div>
+
+  <div id="synthView">
+    <div class="synthbar">
+      <input id="synthQ" type="text" placeholder="a topic to synthesize across all your notes — e.g. “what do I believe about creativity”" autocomplete="off" />
+      <button id="synthBtn">synthesize</button>
+    </div>
+    <main>
+      <div class="synthwrap">
+        <div id="synthOut" class="synthout"></div>
+        <div id="synthSources" class="synthsources"></div>
+      </div>
+    </main>
   </div>
 
 <script>
@@ -315,22 +351,68 @@ canvas.addEventListener("mousemove", e => {
 canvas.addEventListener("mouseleave", () => tip.style.opacity=0);
 canvas.addEventListener("click", e => {
   const r = canvas.getBoundingClientRect(), p = nearest(e.clientX-r.left, e.clientY-r.top);
-  if (p){ showView("search"); qEl.value = p.title; doSearch(); }
+  if (p){ setView("search"); qEl.value = p.title; doSearch(); }
 });
 let kt; kSlider.addEventListener("input", () => { kVal.textContent = kSlider.value;
   clearTimeout(kt); kt = setTimeout(() => loadClusters(+kSlider.value), 250); });
 window.addEventListener("resize", () => { if (mapView.classList.contains("on")) resize(); });
 
-function showView(v){
-  const map = v === "map";
-  tabMap.classList.toggle("on", map); tabSearch.classList.toggle("on", !map);
-  mapView.classList.toggle("on", map); searchView.style.display = map ? "none" : "flex";
-  if (map){ if (!mapLoaded){ mapLoaded = true; loadClusters(+kSlider.value); } else resize(); }
-  else if (qEl) qEl.focus();
-}
 searchView.style.display = "flex"; searchView.style.flexDirection = "column"; searchView.style.flex = "1 1 auto"; searchView.style.minHeight = "0";
-tabSearch.addEventListener("click", () => showView("search"));
-tabMap.addEventListener("click", () => showView("map"));
+
+// ---------- synthesize ----------
+const synthView = $("#synthView"), tabSynth = $("#tabSynth"),
+      synthQ = $("#synthQ"), synthBtn = $("#synthBtn"),
+      synthOut = $("#synthOut"), synthSources = $("#synthSources");
+
+function renderSynth(d){
+  // turn [n] into clickable superscript anchors to the source list
+  const body = esc(d.synthesis).replace(/\[(\d+)\]/g, (_, n) => `<a class="cite" href="#src-${n}">[${n}]</a>`);
+  const conf = d.lowConfidence ? `<div class="note">low confidence — few notes strongly matched this topic; treat as suggestive.</div>` : "";
+  const prov = d.provenance;
+  const meta = `<div class="note">${d.sources.length} sources · ${d.ms} ms`
+    + (d.cost ? ` · ~$${d.cost.toFixed(4)}` : "")
+    + (prov.hallucinated.length ? ` · ⚠ ${prov.hallucinated.length} invalid citations` : "")
+    + `</div>`;
+  synthOut.innerHTML = conf + `<div>${body}</div>` + meta;
+  synthSources.innerHTML = `<h3>sources</h3>` + d.sources.map(s => `
+    <div class="src" id="src-${s.n}">
+      <span class="num">[${s.n}]</span>
+      <div class="body">
+        <div class="t">${esc(s.title) || "(untitled)"} <span class="m">${s.folder?esc(s.folder)+" · ":""}${s.modified?fmtDate(s.modified):""} · ${(s.rel*100).toFixed(0)}% match</span></div>
+        <div class="x">${esc(s.excerpt)}…</div>
+      </div>
+    </div>`).join("");
+}
+async function runSynth(){
+  const q = synthQ.value.trim(); if (!q) return;
+  synthBtn.disabled = true;
+  synthOut.innerHTML = `<div class="note"><span class="spinner"></span> reading across your notes and synthesizing… (can take ~10–20s)</div>`;
+  synthSources.innerHTML = "";
+  try {
+    const r = await fetch("/api/synthesize?q=" + encodeURIComponent(q));
+    const d = await r.json();
+    if (!r.ok){ synthOut.innerHTML = `<div class="note">${esc(d.error || ("error " + r.status))}</div>`; }
+    else renderSynth(d);
+  } catch(e){ synthOut.innerHTML = `<div class="note">failed: ${esc(e.message)}</div>`; }
+  finally { synthBtn.disabled = false; }
+}
+synthBtn.addEventListener("click", runSynth);
+synthQ.addEventListener("keydown", e => { if (e.key === "Enter") runSynth(); });
+
+function setView(v){
+  tabSearch.classList.toggle("on", v==="search");
+  tabMap.classList.toggle("on", v==="map");
+  tabSynth.classList.toggle("on", v==="synth");
+  searchView.style.display = v==="search" ? "flex" : "none";
+  mapView.classList.toggle("on", v==="map");
+  synthView.classList.toggle("on", v==="synth");
+  if (v==="map"){ if (!mapLoaded){ mapLoaded = true; loadClusters(+kSlider.value); } else resize(); }
+  if (v==="search" && qEl) qEl.focus();
+  if (v==="synth") synthQ.focus();
+}
+tabSearch.addEventListener("click", () => setView("search"));
+tabMap.addEventListener("click", () => setView("map"));
+tabSynth.addEventListener("click", () => setView("synth"));
 
 refreshStatus();
 </script>
