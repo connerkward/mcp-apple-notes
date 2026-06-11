@@ -159,12 +159,17 @@ const getNotesTableSchema = async () => {
       }
 
       const func = new OnDeviceEmbeddingFunction();
+      // ONE sourceField only. Multiple sourceFields made LanceDB embed the LAST
+      // one (folder) — every vector in a folder was identical, so the vector arm
+      // of search/related-notes/clustering was folder-identity noise. content is
+      // the only field that should drive the embedding; title relevance is
+      // handled by the title FTS index + title boost at query time.
       return LanceSchema({
-        title: func.sourceField(new Utf8()),
+        title: new Utf8(),
         content: func.sourceField(new Utf8()),
-        creation_date: func.sourceField(new Utf8()),
-        modification_date: func.sourceField(new Utf8()),
-        folder: func.sourceField(new Utf8()),
+        creation_date: new Utf8(),
+        modification_date: new Utf8(),
+        folder: new Utf8(),
         vector: func.vectorField(),
       });
     })();
