@@ -63,6 +63,20 @@
   .card .snippet { color:var(--fg); font-size:13.5px; opacity:.92; white-space:pre-wrap;
                    word-break:break-word; }
   .card mark { background:var(--hi); color:inherit; border-radius:2px; padding:0 1px; }
+  .card .relbtn { margin-top:8px; font-size:12px; color:var(--accent); background:none; border:none;
+                  padding:0; cursor:pointer; font-family:var(--sans); }
+  .card .relbtn:hover { text-decoration:underline; }
+  .relpanel { margin-top:8px; padding:8px 10px; background:var(--bg); border:1px solid var(--line);
+              border-radius:8px; font-size:13px; display:none; }
+  .relpanel.open { display:block; }
+  .relpanel .ents { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:8px; }
+  .relpanel .ent { font-size:11px; background:var(--paper); border:1px solid var(--line);
+                   border-radius:20px; padding:2px 9px; cursor:pointer; }
+  .relpanel .ent:hover { border-color:var(--accent); }
+  .relpanel .rel { padding:3px 0; cursor:pointer; }
+  .relpanel .rel:hover { color:var(--accent); }
+  .relpanel .rel .sh { color:var(--mut); font-size:11px; }
+  .relpanel .none { color:var(--mut); font-style:italic; }
 
   .empty { text-align:center; color:var(--mut); padding:48px 0; font-style:italic; }
   .spinner { width:14px; height:14px; border:2px solid var(--line);
@@ -234,8 +248,34 @@ function render(results, q, ms){
         ${r.modified ? `<span>${fmtDate(r.modified)}</span>` : ""}
       </div>
       <div class="snippet">${highlight(r.snippet || "", q)}</div>
+      ${graphAvailable ? `<button class="relbtn" data-title="${encodeURIComponent(r.title||"")}">related (graph) ↘</button><div class="relpanel"></div>` : ""}
     </div>`).join("");
 }
+
+// graph-backed "related notes" — expand under a card, powered by the Kuzu sidecar
+let graphAvailable = false;
+async function checkGraph(){
+  try { const r = await fetch("/api/graph-status"); if (r.ok){ const s = await r.json(); graphAvailable = !!s.ok;
+    if (graphAvailable) statusEl.title = (statusEl.title||"") + ` · graph: ${s.episodes} notes, ${s.entities} entities`; } }
+  catch { graphAvailable = false; }
+}
+resEl.addEventListener("click", async e => {
+  const ent = e.target.closest(".ent");
+  if (ent){ setView("search"); qEl.value = ent.dataset.name; doSearch(); return; }
+  const rel = e.target.closest(".rel");
+  if (rel){ setView("search"); qEl.value = rel.dataset.note; doSearch(); return; }
+  const btn = e.target.closest(".relbtn");
+  if (!btn) return;
+  const panel = btn.nextElementSibling;
+  if (panel.classList.contains("open")){ panel.classList.remove("open"); return; }
+  panel.classList.add("open"); panel.innerHTML = `<span class="spinner"></span>`;
+  try {
+    const d = await (await fetch("/api/related?title=" + btn.dataset.title)).json();
+    const ents = (d.entities||[]).map(en => `<span class="ent" data-name="${esc(en)}">${esc(en)}</span>`).join("");
+    const rels = (d.related||[]).map(x => `<div class="rel" data-note="${esc(x.note)}">${esc(x.note)} <span class="sh">· ${x.shared} shared</span></div>`).join("");
+    panel.innerHTML = (ents?`<div class="ents">${ents}</div>`:"") + (rels || `<div class="none">no graph connections (this note may not be in the ${" "}indexed subset yet)</div>`);
+  } catch(err){ panel.innerHTML = `<div class="none">graph error</div>`; }
+});
 
 // debounce
 let t; function onInput(){ clearTimeout(t); t = setTimeout(doSearch, 180); }
@@ -431,6 +471,7 @@ tabMap.addEventListener("click", () => setView("map"));
 tabSynth.addEventListener("click", () => setView("synth"));
 
 refreshStatus();
+checkGraph();
 </script>
 </body>
 </html>

@@ -11,6 +11,35 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import { computeClusters } from "./clustering";
 import { synthesize } from "./synthesize";
+import { spawn } from "node:child_process";
+
+// Knowledge-graph sidecar (optional). The Graphiti/Kuzu graph is queried by a tiny
+// read-only Python sidecar (Kuzu is single-process); we auto-spawn it if the graph
+// exists and proxy /api/related to it. Graph QUERIES need no LLM/key.
+const GRAPH_PORT = process.env.GRAPH_PORT || "3743";
+const GRAPH_DB = process.env.GRAPH_DB || path.join(os.homedir(), "dev", "exp-notes-indexing", "graphiti_notes.kuzu");
+const GRAPH_PY = process.env.GRAPH_PY || path.join(os.homedir(), "dev", "exp-notes-indexing", ".venv", "bin", "python");
+let graphUp = false;
+const startGraphSidecar = () => {
+  const fsmod = require("node:fs");
+  if (!fsmod.existsSync(GRAPH_DB) || !fsmod.existsSync(GRAPH_PY)) {
+    console.error(`Graph sidecar skipped (no graph DB or python at ${GRAPH_DB} / ${GRAPH_PY}).`);
+    return;
+  }
+  const proc = spawn(GRAPH_PY, [path.join(import.meta.dirname, "graph", "server.py")], {
+    env: { ...process.env, GRAPH_DB, GRAPH_PORT },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  proc.stdout.on("data", (d) => console.error(`[graph] ${d}`.trim()));
+  proc.stderr.on("data", (d) => console.error(`[graph] ${d}`.trim()));
+  proc.on("exit", (code) => { graphUp = false; console.error(`[graph] sidecar exited (${code})`); });
+  graphUp = true;
+  process.on("exit", () => proc.kill());
+};
+const graphFetch = async (apiPath: string) => {
+  const r = await fetch(`http://127.0.0.1:${GRAPH_PORT}${apiPath}`);
+  return await r.json();
+};
 
 // LLM config for synthesis (optional). Read once; key is never logged.
 // Works with a LOCAL OpenAI-compatible server (LM Studio / Ollama) or real OpenAI:
@@ -1228,6 +1257,17 @@ if (process.argv.includes("--stdio")) {
       return;
     }
 
+    // ---- knowledge-graph proxy (Graphiti/Kuzu via sidecar; no LLM needed) ----
+    if (req.method === "GET" && (u.pathname === "/api/graph-status" || u.pathname === "/api/related" || u.pathname === "/api/graph-entity")) {
+      if (!graphUp) { sendJson(503, { error: "graph not available (no indexed graph / sidecar down)" }); return; }
+      try {
+        if (u.pathname === "/api/graph-status") { sendJson(200, await graphFetch("/health")); return; }
+        if (u.pathname === "/api/related") { sendJson(200, await graphFetch("/related?title=" + encodeURIComponent(u.searchParams.get("title") ?? ""))); return; }
+        sendJson(200, await graphFetch("/entity?name=" + encodeURIComponent(u.searchParams.get("name") ?? "")));
+      } catch (e: any) { sendJson(502, { error: "graph sidecar error: " + String(e?.message ?? e) }); }
+      return;
+    }
+
     if (req.method === "GET" && u.pathname === "/api/synthesize") {
       const q = (u.searchParams.get("q") ?? "").trim();
       if (!q) { sendJson(400, { error: "missing q" }); return; }
@@ -1301,6 +1341,7 @@ if (process.argv.includes("--stdio")) {
     console.error(`MCP endpoint:           http://localhost:${PORT}/mcp`);
     console.error(`Expose with: npx cloudflared tunnel --url http://localhost:${PORT}`);
   });
+  startGraphSidecar();
 }
 
 } // end import.meta.main
