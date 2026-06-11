@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>apple notes — semantic search</title>
+<style>
+  :root {
+    --bg:#f5f1e8; --paper:#ece6d6; --fg:#1a1815; --mut:#7c7569; --line:#d6cebb;
+    --accent:#2f7d52; --hi:#f2e07a; --card:#fbf8f0;
+    --serif: ui-serif, "Iowan Old Style", "Charter", Georgia, serif;
+    --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16140f; --paper:#1f1c16; --fg:#ece6d6; --mut:#80796b; --line:#2b2820;
+            --accent:#5fb585; --hi:#6b5d1f; --card:#1b1813; }
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.55 var(--sans);
+         -webkit-font-smoothing:antialiased; display:flex; flex-direction:column; }
+  body::before {
+    content:""; position:fixed; inset:0; z-index:-1; pointer-events:none;
+    opacity:.04; mix-blend-mode:multiply;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    background-size:160px 160px;
+  }
+  @media (prefers-color-scheme: dark){ body::before{ mix-blend-mode:screen; opacity:.05; } }
+
+  header { display:flex; align-items:center; gap:16px; padding:12px 24px;
+           border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  h1 { font:italic 400 22px/1 var(--serif); margin:0; letter-spacing:-.01em;
+       text-transform:lowercase; white-space:nowrap; }
+  .sp { flex:1 1 auto; }
+  #status { color:var(--mut); font-size:12px; white-space:nowrap; overflow:hidden;
+            text-overflow:ellipsis; max-width:46ch; }
+  button { font:inherit; font-size:13px; color:var(--fg); background:var(--paper);
+           border:1px solid var(--line); border-radius:7px; padding:6px 12px;
+           cursor:pointer; transition:transform .08s ease, background .15s ease; }
+  button:hover { background:var(--card); }
+  button:active { transform:translateY(1px); }
+  button:disabled { opacity:.5; cursor:default; }
+
+  .searchbar { padding:18px 24px 6px; }
+  .searchrow { display:flex; gap:10px; max-width:920px; margin:0 auto; }
+  #q { flex:1 1 auto; font:16px var(--sans); color:var(--fg);
+       background:var(--card); border:1px solid var(--line); border-radius:10px;
+       padding:12px 14px; outline:none; }
+  #q:focus { border-color:var(--accent); }
+  #folder { font:13px var(--sans); color:var(--fg); background:var(--card);
+            border:1px solid var(--line); border-radius:10px; padding:0 10px; max-width:220px; }
+
+  main { flex:1 1 auto; overflow:auto; padding:8px 24px 60px; }
+  .results { max-width:920px; margin:0 auto; }
+  .meta { color:var(--mut); font-size:12px; max-width:920px; margin:6px auto 14px; }
+
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:14px 16px; margin:10px 0; }
+  .card .title { font:600 16px/1.3 var(--serif); margin:0 0 3px; }
+  .card .sub { color:var(--mut); font-size:12px; margin-bottom:7px;
+               display:flex; gap:10px; flex-wrap:wrap; }
+  .card .sub .folder::before { content:"▸ "; }
+  .card .snippet { color:var(--fg); font-size:13.5px; opacity:.92; white-space:pre-wrap;
+                   word-break:break-word; }
+  .card mark { background:var(--hi); color:inherit; border-radius:2px; padding:0 1px; }
+
+  .empty { text-align:center; color:var(--mut); padding:48px 0; font-style:italic; }
+  .spinner { width:14px; height:14px; border:2px solid var(--line);
+             border-top-color:var(--accent); border-radius:50%;
+             animation:spin .7s linear infinite; display:inline-block; vertical-align:-2px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .bar { height:4px; background:var(--line); border-radius:3px; overflow:hidden; margin-top:8px; max-width:920px; }
+  .bar > i { display:block; height:100%; background:var(--accent); width:0; transition:width .3s ease; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>apple notes</h1>
+    <div class="sp"></div>
+    <span id="status">loading…</span>
+    <button id="indexBtn" title="Re-index notes from Apple Notes">index</button>
+  </header>
+
+  <div class="searchbar">
+    <div class="searchrow">
+      <input id="q" type="search" placeholder="search your notes by meaning…" autofocus autocomplete="off" />
+      <input id="folder" type="text" placeholder="folder (optional)" autocomplete="off" />
+    </div>
+    <div class="bar" id="indexBar" style="display:none"><i></i></div>
+  </div>
+
+  <main>
+    <div class="meta" id="meta"></div>
+    <div class="results" id="results"></div>
+  </main>
+
+<script>
+const $ = s => document.querySelector(s);
+const qEl = $("#q"), folderEl = $("#folder"), resEl = $("#results"),
+      metaEl = $("#meta"), statusEl = $("#status"),
+      indexBtn = $("#indexBtn"), indexBar = $("#indexBar"), indexBarI = indexBar.querySelector("i");
+
+function esc(s){ return (s||"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
+function highlight(text, q){
+  const words = q.toLowerCase().split(/\W+/).filter(w => w.length > 2);
+  let html = esc(text);
+  for (const w of [...new Set(words)]) {
+    const re = new RegExp("(" + w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "ig");
+    html = html.replace(re, "<mark>$1</mark>");
+  }
+  return html;
+}
+function fmtDate(s){ if(!s) return ""; const d = new Date(s); return isNaN(d) ? "" : d.toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"}); }
+
+async function refreshStatus(){
+  try {
+    const r = await fetch("/api/status"); const s = await r.json();
+    statusEl.textContent = `${s.indexed.toLocaleString()} chunks · ${s.model}`;
+    statusEl.title = `db: ${s.db}`;
+  } catch { statusEl.textContent = "server unreachable"; }
+}
+
+let searchSeq = 0;
+async function doSearch(){
+  const q = qEl.value.trim();
+  const folder = folderEl.value.trim();
+  if (!q){ resEl.innerHTML = ""; metaEl.textContent = ""; return; }
+  const seq = ++searchSeq;
+  metaEl.innerHTML = `<span class="spinner"></span> searching…`;
+  try {
+    const url = `/api/search?q=${encodeURIComponent(q)}&k=25` + (folder ? `&folder=${encodeURIComponent(folder)}` : "");
+    const r = await fetch(url); const data = await r.json();
+    if (seq !== searchSeq) return;            // stale response, newer query in flight
+    render(data.results || [], q, data.ms);
+  } catch (e){
+    if (seq !== searchSeq) return;
+    metaEl.textContent = "search failed: " + e.message;
+  }
+}
+function render(results, q, ms){
+  metaEl.textContent = `${results.length} result${results.length===1?"":"s"}` + (ms!=null?` · ${ms} ms`:"");
+  if (!results.length){ resEl.innerHTML = `<div class="empty">no notes match “${esc(q)}”.</div>`; return; }
+  resEl.innerHTML = results.map(r => `
+    <div class="card">
+      <div class="title">${esc(r.title) || "(untitled)"}</div>
+      <div class="sub">
+        ${r.folder ? `<span class="folder">${esc(r.folder)}</span>` : ""}
+        ${r.modified ? `<span>${fmtDate(r.modified)}</span>` : ""}
+      </div>
+      <div class="snippet">${highlight(r.snippet || "", q)}</div>
+    </div>`).join("");
+}
+
+// debounce
+let t; function onInput(){ clearTimeout(t); t = setTimeout(doSearch, 180); }
+qEl.addEventListener("input", onInput);
+folderEl.addEventListener("input", onInput);
+qEl.addEventListener("keydown", e => { if (e.key === "Enter"){ clearTimeout(t); doSearch(); } });
+
+// indexing
+let pollTimer;
+async function startIndex(){
+  indexBtn.disabled = true; indexBtn.textContent = "indexing…";
+  indexBar.style.display = "block"; indexBarI.style.width = "0%";
+  try {
+    const r = await fetch("/api/index", { method:"POST" }); const { jobId } = await r.json();
+    pollTimer = setInterval(() => pollJob(jobId), 800);
+  } catch (e){ indexBtn.disabled = false; indexBtn.textContent = "index"; statusEl.textContent = "index failed: " + e.message; }
+}
+async function pollJob(jobId){
+  try {
+    const r = await fetch("/api/index-status?jobId=" + encodeURIComponent(jobId)); const j = await r.json();
+    const pct = j.total ? Math.round(100 * j.progress / j.total) : 0;
+    indexBarI.style.width = pct + "%";
+    statusEl.textContent = `${j.message || j.status} ${j.total ? `(${j.progress}/${j.total})` : ""}`;
+    if (j.status === "completed" || j.status === "failed" || j.status === "cancelled"){
+      clearInterval(pollTimer);
+      indexBtn.disabled = false; indexBtn.textContent = "index";
+      setTimeout(() => { indexBar.style.display = "none"; }, 1200);
+      refreshStatus(); if (qEl.value.trim()) doSearch();
+    }
+  } catch { /* keep polling */ }
+}
+indexBtn.addEventListener("click", startIndex);
+
+refreshStatus();
+</script>
+</body>
+</html>

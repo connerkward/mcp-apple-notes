@@ -1153,7 +1153,78 @@ if (process.argv.includes("--stdio")) {
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version");
     res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
     if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
-    if (req.url === "/mcp") {
+
+    const u = new URL(req.url ?? "/", `http://localhost:${PORT}`);
+    const sendJson = (code: number, obj: unknown) => {
+      res.writeHead(code, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(obj));
+    };
+
+    // ---- muser-style local web UI (standalone, no MCP client needed) ----
+    if (req.method === "GET" && (u.pathname === "/" || u.pathname === "/index.html")) {
+      try {
+        const html = await fs.readFile(path.join(import.meta.dirname, "web", "search.html"), "utf-8");
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(html);
+      } catch {
+        res.writeHead(500, { "Content-Type": "text/plain" });
+        res.end("Missing web/search.html");
+      }
+      return;
+    }
+
+    // ---- JSON search API (mirrors muser: /api/status, /api/search, /api/index) ----
+    if (req.method === "GET" && u.pathname === "/api/status") {
+      try {
+        const { notesTable } = await createNotesTable();
+        const indexed = await notesTable.countRows().catch(() => 0);
+        sendJson(200, { model: "all-MiniLM-L6-v2", indexed, db: path.join(os.homedir(), ".mcp-apple-notes", "data") });
+      } catch (e: any) {
+        sendJson(500, { error: String(e?.message ?? e) });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/search") {
+      const q = u.searchParams.get("q") ?? "";
+      if (!q.trim()) { sendJson(200, { results: [], ms: 0 }); return; }
+      const k = Math.min(parseInt(u.searchParams.get("k") ?? "25") || 25, 100);
+      const folder = u.searchParams.get("folder") ?? undefined;
+      try {
+        await syncReindexIfNeeded();
+        const { notesTable } = await createNotesTable();
+        const t0 = performance.now();
+        const results = await searchAndCombineResults(notesTable, q, k, folder);
+        sendJson(200, { results, ms: Math.round(performance.now() - t0) });
+      } catch (e: any) {
+        sendJson(500, { error: String(e?.message ?? e), results: [] });
+      }
+      return;
+    }
+
+    if (req.method === "POST" && u.pathname === "/api/index") {
+      try {
+        const jobId = await startIndexJobLazy();
+        sendJson(200, { jobId });
+      } catch (e: any) {
+        sendJson(500, { error: String(e?.message ?? e) });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/index-status") {
+      const jobId = u.searchParams.get("jobId") ?? "";
+      const job = indexJobs.get(jobId);
+      if (!job) { sendJson(404, { error: "unknown jobId" }); return; }
+      sendJson(200, {
+        jobId: job.id, status: job.status, progress: job.progress,
+        total: job.total, message: job.message, error: job.error,
+      });
+      return;
+    }
+
+    // ---- MCP-over-HTTP transport ----
+    if (u.pathname === "/mcp") {
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c));
       req.on("end", async () => {
@@ -1164,12 +1235,14 @@ if (process.argv.includes("--stdio")) {
         await server.connect(transport);
         await transport.handleRequest(req, res, body);
       });
-    } else {
-      res.writeHead(404); res.end();
+      return;
     }
+
+    res.writeHead(404); res.end();
   });
   httpServer.listen(PORT, () => {
-    console.error(`MCP server running on http://localhost:${PORT}/mcp`);
+    console.error(`Apple Notes search UI:  http://localhost:${PORT}/`);
+    console.error(`MCP endpoint:           http://localhost:${PORT}/mcp`);
     console.error(`Expose with: npx cloudflared tunnel --url http://localhost:${PORT}`);
   });
 }
