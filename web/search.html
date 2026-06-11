@@ -323,35 +323,51 @@ function resize(){
   screenPts = pts.map(p => ({ ...p, X: ox+(p.x-minX)*s, Y: oy+(p.y-minY)*s }));
   draw();
 }
+let hoverPt = -1;   // index of hovered point → draw neighbor-lens
 function draw(){
   if (!mapData) return;
   const w = canvas.clientWidth, h = canvas.clientHeight, k = mapData.clusters.length;
   ctx.clearRect(0,0,w,h);
-  for (const p of screenPts){
+  // neighbor-lens: lines from the hovered note to its nearest-by-meaning notes
+  if (hoverPt >= 0 && screenPts[hoverPt]){
+    const p = screenPts[hoverPt];
+    ctx.strokeStyle = getComputedStyle(document.body).getPropertyValue("--accent") || "#2f7d52";
+    ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
+    for (const j of (p.nbr || [])){
+      const q = screenPts[j]; if (!q || hidden.has(q.cluster)) continue;
+      ctx.beginPath(); ctx.moveTo(p.X, p.Y); ctx.lineTo(q.X, q.Y); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+  const nbrSet = hoverPt >= 0 && screenPts[hoverPt] ? new Set(screenPts[hoverPt].nbr) : null;
+  for (let i = 0; i < screenPts.length; i++){
+    const p = screenPts[i];
     if (hidden.has(p.cluster)) continue;
-    const focused = hoverCluster === -1 || p.cluster === hoverCluster;
-    ctx.globalAlpha = focused ? 0.85 : 0.08;
+    const lit = (hoverCluster === -1 || p.cluster === hoverCluster);
+    const isNbr = nbrSet && (nbrSet.has(i) || i === hoverPt);
+    ctx.globalAlpha = isNbr ? 1 : (lit ? 0.85 : 0.08);
     ctx.fillStyle = clusterColor(p.cluster, k);
-    ctx.beginPath(); ctx.arc(p.X, p.Y, focused ? 3.2 : 2.4, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(p.X, p.Y, isNbr ? 4.5 : (lit ? 3.2 : 2.4), 0, 7); ctx.fill();
   }
   ctx.globalAlpha = 1;
 }
-function nearest(mx, my){
-  let best=null, bd=144; // 12px radius²
-  for (const p of screenPts){ if(hidden.has(p.cluster)) continue; const dx=p.X-mx, dy=p.Y-my, d=dx*dx+dy*dy; if(d<bd){bd=d;best=p;} }
+function nearestIdx(mx, my){
+  let best=-1, bd=144; // 12px radius²
+  for (let i=0;i<screenPts.length;i++){ const p=screenPts[i]; if(hidden.has(p.cluster)) continue; const dx=p.X-mx, dy=p.Y-my, d=dx*dx+dy*dy; if(d<bd){bd=d;best=i;} }
   return best;
 }
 canvas.addEventListener("mousemove", e => {
   const r = canvas.getBoundingClientRect(), mx = e.clientX-r.left, my = e.clientY-r.top;
-  const p = nearest(mx,my);
-  if (p){ tip.style.opacity=1; tip.style.left=p.X+"px"; tip.style.top=p.Y+"px";
+  const i = nearestIdx(mx,my);
+  if (i !== hoverPt){ hoverPt = i; draw(); }
+  if (i >= 0){ const p = screenPts[i]; tip.style.opacity=1; tip.style.left=p.X+"px"; tip.style.top=p.Y+"px";
           tip.textContent = (p.title||"(untitled)") + (p.folder?` — ${p.folder}`:""); canvas.style.cursor="pointer"; }
   else { tip.style.opacity=0; canvas.style.cursor="crosshair"; }
 });
-canvas.addEventListener("mouseleave", () => tip.style.opacity=0);
+canvas.addEventListener("mouseleave", () => { tip.style.opacity=0; if (hoverPt !== -1){ hoverPt=-1; draw(); } });
 canvas.addEventListener("click", e => {
-  const r = canvas.getBoundingClientRect(), p = nearest(e.clientX-r.left, e.clientY-r.top);
-  if (p){ setView("search"); qEl.value = p.title; doSearch(); }
+  const r = canvas.getBoundingClientRect(), i = nearestIdx(e.clientX-r.left, e.clientY-r.top);
+  if (i >= 0){ setView("search"); qEl.value = screenPts[i].title; doSearch(); }
 });
 let kt; kSlider.addEventListener("input", () => { kVal.textContent = kSlider.value;
   clearTimeout(kt); kt = setTimeout(() => loadClusters(+kSlider.value), 250); });
