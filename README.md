@@ -40,6 +40,35 @@ A [Model Context Protocol (MCP)](https://www.anthropic.com/news/model-context-pr
 - 🍎 Direct SQLite + protobuf decode — real note text, not garbled HTML
 - 🏃‍♂️ Fully local — no API keys, no cloud
 
+## Local web app — not just search, but connections & synthesis
+
+Run the server directly and open the browser UI — no MCP client needed:
+
+```bash
+bun index.ts            # → http://localhost:3741/   (also serves /mcp)
+```
+
+Four modes, building from retrieval toward sensemaking:
+
+- **Search** — the hybrid semantic + BM25 search, in a paper-themed UI with query highlighting and folder filter. Each result can expand a **related (graph)** panel (see graph below).
+- **Map** — a topic map of every note: spherical k-means clusters (TF-IDF labels) over the embeddings, projected to 2D with PCA. Hover a note for the **neighbor-lens** — lines to its nearest-by-meaning notes, which often cross clusters (the connection-finding payload). Endpoint: `GET /api/clusters?k=`.
+- **Synthesize** — *"what do I think about X across everything I've written?"* Query-expansion → relevance-gated retrieval (no recency bias) → MMR diversification → an LLM writes a grounded answer with inline `[n]` citations back to the source notes; provenance is post-checked. Endpoint: `GET /api/synthesize?q=`.
+- **Graph** — entity-based related notes from a [Graphiti](https://github.com/getzep/graphiti) / Kuzu knowledge graph (people/places/concepts extracted per note). Graph **queries need no LLM** (read-only Cypher via a small Python sidecar that the server auto-spawns). Endpoints: `/api/related`, `/api/graph-entity`, `/api/graph-status`.
+
+### Enabling synthesis (needs an LLM)
+
+Embeddings/search/clustering/graph-queries are fully local. Only **synthesis generation** and **building the graph** need an LLM. Point at a local OpenAI-compatible server to keep notes private:
+
+```bash
+# LM Studio / Ollama (zero API cost, notes stay local):
+SYNTH_BASE_URL=http://localhost:1234/v1 SYNTH_MODEL=<loaded-model> OPENAI_API_KEY=local bun index.ts
+# …or real OpenAI: set a funded OPENAI_API_KEY (defaults to gpt-4o-mini).
+```
+
+### The knowledge graph
+
+The graph is built by the companion [`exp-notes-indexing`](https://github.com/connerkward/exp-notes-indexing) pipeline (Apple Notes → entity/relationship extraction → Kuzu). The web app reads it via `graph/server.py`; configure with `GRAPH_DB` (path to the `.kuzu`), `GRAPH_PY` (python with `kuzu` installed), `GRAPH_PORT`. If no graph is present the UI simply omits the graph panel.
+
 ## Installation
 
 1. Clone and install:
