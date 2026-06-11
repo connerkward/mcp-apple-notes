@@ -10,6 +10,7 @@ import os from "node:os";
 import fs from "node:fs/promises";
 import http from "node:http";
 import { computeClusters } from "./clustering";
+import { computeBridges } from "./bridges";
 import { synthesize } from "./synthesize";
 import { spawn } from "node:child_process";
 
@@ -1006,6 +1007,17 @@ server.tool("related-notes", {
   return createTextResponse(JSON.stringify(results));
 });
 
+server.tool("bridge-notes", {
+  limit: z.number().int().min(1).max(200).optional().describe("Max bridges (default 20)"),
+  folder: z.string().optional().describe("Only bridges where A or C is in this folder (exact path segment match)"),
+}, async ({ limit = 20, folder }) => {
+  const { notesTable } = await createNotesTable();
+  const extractor = await getExtractor();
+  const embedBatch = async (arr: string[]) => (await extractor(arr, { pooling: "mean", normalize: true })).tolist() as number[][];
+  const result = await computeBridges({ table: notesTable, embedBatch, limit, folder });
+  return createTextResponse(JSON.stringify(result));
+});
+
 server.tool("get-tables", { title: z.string().describe("Exact note title") }, async ({ title }) => {
   const note = await getNoteDetailsByTitle(title);
   if (!note?.title) return createTextResponse(JSON.stringify({ error: `Note not found: "${title}"` }));
@@ -1291,6 +1303,20 @@ if (process.argv.includes("--stdio")) {
         const { notesTable } = await createNotesTable();
         const result = await computeClusters(notesTable, k);
         sendJson(200, result);
+      } catch (e: any) {
+        sendJson(500, { error: String(e?.message ?? e) });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/bridges") {
+      const limit = Math.min(Math.max(parseInt(u.searchParams.get("limit") ?? "40") || 40, 1), 200);
+      const folder = u.searchParams.get("folder") ?? undefined;
+      try {
+        const { notesTable } = await createNotesTable();
+        const extractor = await getExtractor();
+        const embedBatch = async (arr: string[]) => (await extractor(arr, { pooling: "mean", normalize: true })).tolist() as number[][];
+        sendJson(200, await computeBridges({ table: notesTable, embedBatch, limit, folder }));
       } catch (e: any) {
         sendJson(500, { error: String(e?.message ?? e) });
       }
