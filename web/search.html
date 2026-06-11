@@ -71,28 +71,78 @@
   @keyframes spin { to { transform:rotate(360deg); } }
   .bar { height:4px; background:var(--line); border-radius:3px; overflow:hidden; margin-top:8px; max-width:920px; }
   .bar > i { display:block; height:100%; background:var(--accent); width:0; transition:width .3s ease; }
+
+  /* view toggle */
+  .nav { display:flex; gap:2px; background:var(--paper); border:1px solid var(--line); border-radius:8px; padding:2px; }
+  .nav button { border:none; background:transparent; border-radius:6px; padding:5px 12px; }
+  .nav button.on { background:var(--card); box-shadow:0 1px 2px rgba(0,0,0,.06); }
+
+  /* map view */
+  #mapView { flex:1 1 auto; display:none; min-height:0; }
+  #mapView.on { display:flex; }
+  .mapwrap { flex:1 1 auto; position:relative; min-width:0; }
+  #map { width:100%; height:100%; display:block; cursor:crosshair; }
+  .maptip { position:absolute; pointer-events:none; background:var(--fg); color:var(--bg);
+            font-size:12px; padding:5px 8px; border-radius:6px; max-width:280px; opacity:0;
+            transition:opacity .1s; transform:translate(-50%,-130%); white-space:nowrap;
+            overflow:hidden; text-overflow:ellipsis; z-index:5; }
+  .legend { width:230px; flex:0 0 230px; border-left:1px solid var(--line); overflow:auto; padding:12px 14px; }
+  .legend h3 { font:italic 400 15px/1 var(--serif); margin:0 0 10px; color:var(--mut); }
+  .legend .row { display:flex; align-items:center; gap:8px; padding:5px 6px; border-radius:7px;
+                 cursor:pointer; font-size:13px; }
+  .legend .row:hover { background:var(--paper); }
+  .legend .row.dim { opacity:.4; }
+  .legend .dot { width:11px; height:11px; border-radius:50%; flex:0 0 auto; }
+  .legend .row .lab { flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .legend .row .ct { color:var(--mut); font-size:11px; }
+  .mapctl { display:flex; align-items:center; gap:8px; padding:8px 14px; color:var(--mut); font-size:12px; }
+  .mapctl input[type=range] { accent-color:var(--accent); }
 </style>
 </head>
 <body>
   <header>
     <h1>apple notes</h1>
+    <div class="nav">
+      <button id="tabSearch" class="on">search</button>
+      <button id="tabMap">map</button>
+    </div>
     <div class="sp"></div>
     <span id="status">loading…</span>
     <button id="indexBtn" title="Re-index notes from Apple Notes">index</button>
   </header>
 
-  <div class="searchbar">
-    <div class="searchrow">
-      <input id="q" type="search" placeholder="search your notes by meaning…" autofocus autocomplete="off" />
-      <input id="folder" type="text" placeholder="folder (optional)" autocomplete="off" />
+  <div id="searchView">
+    <div class="searchbar">
+      <div class="searchrow">
+        <input id="q" type="search" placeholder="search your notes by meaning…" autofocus autocomplete="off" />
+        <input id="folder" type="text" placeholder="folder (optional)" autocomplete="off" />
+      </div>
+      <div class="bar" id="indexBar" style="display:none"><i></i></div>
     </div>
-    <div class="bar" id="indexBar" style="display:none"><i></i></div>
+    <main>
+      <div class="meta" id="meta"></div>
+      <div class="results" id="results"></div>
+    </main>
   </div>
 
-  <main>
-    <div class="meta" id="meta"></div>
-    <div class="results" id="results"></div>
-  </main>
+  <div id="mapView">
+    <div style="flex:1 1 auto; display:flex; flex-direction:column; min-width:0;">
+      <div class="mapctl">
+        <span id="mapMeta">topic map</span>
+        <span class="sp" style="flex:1"></span>
+        <label>clusters <span id="kVal">12</span></label>
+        <input id="kSlider" type="range" min="4" max="30" value="12" />
+      </div>
+      <div class="mapwrap">
+        <canvas id="map"></canvas>
+        <div class="maptip" id="maptip"></div>
+      </div>
+    </div>
+    <div class="legend">
+      <h3>topics</h3>
+      <div id="legendRows"></div>
+    </div>
+  </div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -182,6 +232,105 @@ async function pollJob(jobId){
   } catch { /* keep polling */ }
 }
 indexBtn.addEventListener("click", startIndex);
+
+// ---------- topic map ----------
+const searchView = $("#searchView"), mapView = $("#mapView"),
+      tabSearch = $("#tabSearch"), tabMap = $("#tabMap"),
+      canvas = $("#map"), tip = $("#maptip"), legendRows = $("#legendRows"),
+      kSlider = $("#kSlider"), kVal = $("#kVal"), mapMeta = $("#mapMeta");
+const ctx = canvas.getContext("2d");
+let mapData = null, screenPts = [], hidden = new Set(), hoverCluster = -1, mapLoaded = false;
+
+function clusterColor(i, k){ const h = Math.round(360 * i / Math.max(k,1)); return `hsl(${h} 62% 52%)`; }
+
+async function loadClusters(k){
+  mapMeta.innerHTML = `<span class="spinner"></span> clustering ${k}…`;
+  try {
+    const r = await fetch("/api/clusters?k=" + k); mapData = await r.json();
+    hidden.clear();
+    mapMeta.textContent = `${mapData.notes.toLocaleString()} notes · ${mapData.clusters.length} topics`;
+    buildLegend(); resize();
+  } catch(e){ mapMeta.textContent = "cluster failed: " + e.message; }
+}
+function buildLegend(){
+  const k = mapData.clusters.length;
+  // color is keyed by cluster id; clusters are sorted by size but keep original id for color/lookup
+  legendRows.innerHTML = mapData.clusters.map(c => `
+    <div class="row" data-c="${c.id}">
+      <span class="dot" style="background:${clusterColor(c.id, k)}"></span>
+      <span class="lab" title="${esc(c.terms.join(', '))}">${esc(c.label)}</span>
+      <span class="ct">${c.size}</span>
+    </div>`).join("");
+  legendRows.querySelectorAll(".row").forEach(row => {
+    const cid = +row.dataset.c;
+    row.addEventListener("mouseenter", () => { hoverCluster = cid; draw(); });
+    row.addEventListener("mouseleave", () => { hoverCluster = -1; draw(); });
+    row.addEventListener("click", () => {
+      if (hidden.has(cid)) hidden.delete(cid); else hidden.add(cid);
+      row.classList.toggle("dim", hidden.has(cid)); draw();
+    });
+  });
+}
+function resize(){
+  if (!mapData) return;
+  const wrap = canvas.parentElement, dpr = window.devicePixelRatio || 1;
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  canvas.style.width = w + "px"; canvas.style.height = h + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // project data coords → screen with padding
+  const pad = 28, pts = mapData.points;
+  let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+  for (const p of pts){ if(p.x<minX)minX=p.x; if(p.x>maxX)maxX=p.x; if(p.y<minY)minY=p.y; if(p.y>maxY)maxY=p.y; }
+  const sx = (w-2*pad)/((maxX-minX)||1), sy = (h-2*pad)/((maxY-minY)||1), s = Math.min(sx,sy);
+  const ox = (w-(maxX-minX)*s)/2, oy = (h-(maxY-minY)*s)/2;
+  screenPts = pts.map(p => ({ ...p, X: ox+(p.x-minX)*s, Y: oy+(p.y-minY)*s }));
+  draw();
+}
+function draw(){
+  if (!mapData) return;
+  const w = canvas.clientWidth, h = canvas.clientHeight, k = mapData.clusters.length;
+  ctx.clearRect(0,0,w,h);
+  for (const p of screenPts){
+    if (hidden.has(p.cluster)) continue;
+    const focused = hoverCluster === -1 || p.cluster === hoverCluster;
+    ctx.globalAlpha = focused ? 0.85 : 0.08;
+    ctx.fillStyle = clusterColor(p.cluster, k);
+    ctx.beginPath(); ctx.arc(p.X, p.Y, focused ? 3.2 : 2.4, 0, 7); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+function nearest(mx, my){
+  let best=null, bd=144; // 12px radius²
+  for (const p of screenPts){ if(hidden.has(p.cluster)) continue; const dx=p.X-mx, dy=p.Y-my, d=dx*dx+dy*dy; if(d<bd){bd=d;best=p;} }
+  return best;
+}
+canvas.addEventListener("mousemove", e => {
+  const r = canvas.getBoundingClientRect(), mx = e.clientX-r.left, my = e.clientY-r.top;
+  const p = nearest(mx,my);
+  if (p){ tip.style.opacity=1; tip.style.left=p.X+"px"; tip.style.top=p.Y+"px";
+          tip.textContent = (p.title||"(untitled)") + (p.folder?` — ${p.folder}`:""); canvas.style.cursor="pointer"; }
+  else { tip.style.opacity=0; canvas.style.cursor="crosshair"; }
+});
+canvas.addEventListener("mouseleave", () => tip.style.opacity=0);
+canvas.addEventListener("click", e => {
+  const r = canvas.getBoundingClientRect(), p = nearest(e.clientX-r.left, e.clientY-r.top);
+  if (p){ showView("search"); qEl.value = p.title; doSearch(); }
+});
+let kt; kSlider.addEventListener("input", () => { kVal.textContent = kSlider.value;
+  clearTimeout(kt); kt = setTimeout(() => loadClusters(+kSlider.value), 250); });
+window.addEventListener("resize", () => { if (mapView.classList.contains("on")) resize(); });
+
+function showView(v){
+  const map = v === "map";
+  tabMap.classList.toggle("on", map); tabSearch.classList.toggle("on", !map);
+  mapView.classList.toggle("on", map); searchView.style.display = map ? "none" : "flex";
+  if (map){ if (!mapLoaded){ mapLoaded = true; loadClusters(+kSlider.value); } else resize(); }
+  else if (qEl) qEl.focus();
+}
+searchView.style.display = "flex"; searchView.style.flexDirection = "column"; searchView.style.flex = "1 1 auto"; searchView.style.minHeight = "0";
+tabSearch.addEventListener("click", () => showView("search"));
+tabMap.addEventListener("click", () => showView("map"));
 
 refreshStatus();
 </script>

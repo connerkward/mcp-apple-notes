@@ -9,6 +9,7 @@ import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
 import http from "node:http";
+import { computeClusters } from "./clustering";
 import {
   registerAppResource,
   registerAppTool,
@@ -1198,6 +1199,18 @@ if (process.argv.includes("--stdio")) {
         sendJson(200, { results, ms: Math.round(performance.now() - t0) });
       } catch (e: any) {
         sendJson(500, { error: String(e?.message ?? e), results: [] });
+      }
+      return;
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/clusters") {
+      const k = Math.min(Math.max(parseInt(u.searchParams.get("k") ?? "12") || 12, 2), 40);
+      try {
+        const { notesTable } = await createNotesTable();
+        const result = await computeClusters(notesTable, k);
+        sendJson(200, result);
+      } catch (e: any) {
+        sendJson(500, { error: String(e?.message ?? e) });
       }
       return;
     }
