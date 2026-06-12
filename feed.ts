@@ -41,7 +41,7 @@ export const scoreItem = (w: number[], x: number[]) => sigmoid(dot(w, x));
 
 // A few SGD steps per vote — enough to visibly move the ranking without
 // letting one vote dominate. Deterministic (no shuffling).
-export function sgdStep(w: number[], x: number[], y: 0 | 1, lr = 0.35, steps = 4) {
+export function sgdStep(w: number[], x: number[], y: 0 | 1, lr = 0.25, steps = 3) {
   for (let s = 0; s < steps; s++) {
     const g = scoreItem(w, x) - y;
     for (let i = 0; i < w.length; i++) w[i] -= lr * g * x[i];
