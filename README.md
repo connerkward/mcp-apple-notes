@@ -48,16 +48,17 @@ Run the server directly and open the browser UI — no MCP client needed:
 bun index.ts            # → http://localhost:3741/   (also serves /mcp)
 ```
 
-Four modes, building from retrieval toward sensemaking:
+Five modes, building from retrieval toward sensemaking:
 
-- **Search** — the hybrid semantic + BM25 search, in a paper-themed UI with query highlighting and folder filter. Each result can expand a **related (graph)** panel (see graph below).
+- **Search** — the hybrid semantic + BM25 search, in a paper-themed UI with query highlighting and folder filter.
 - **Map** — a topic map of every note: spherical k-means clusters (TF-IDF labels) over the embeddings, projected to 2D with PCA. Hover a note for the **neighbor-lens** — lines to its nearest-by-meaning notes, which often cross clusters (the connection-finding payload). Endpoint: `GET /api/clusters?k=`.
 - **Synthesize** — *"what do I think about X across everything I've written?"* Query-expansion → relevance-gated retrieval (no recency bias) → MMR diversification → an LLM writes a grounded answer with inline `[n]` citations back to the source notes; provenance is post-checked. Endpoint: `GET /api/synthesize?q=`.
-- **Graph** — entity-based related notes from a [Graphiti](https://github.com/getzep/graphiti) / Kuzu knowledge graph (people/places/concepts extracted per note). Graph **queries need no LLM** (read-only Cypher via a small Python sidecar that the server auto-spawns). Endpoints: `/api/related`, `/api/graph-entity`, `/api/graph-status`.
+- **Bridges** — Swanson-ABC discovery over your own notes: pairs (A, C) that are **not** directly similar but are both strongly similar to a shared bridge note B — connections the corpus only makes through an intermediary. Pure arithmetic over the embeddings (score = sim(A,B)·sim(B,C)·(1−sim(A,C)); cross-folder, no shared tags/wikilinks; thresholds auto-relax; hub-penalized selection so no note dominates the list). No LLM, $0, cached in memory after the first run. Endpoint: `GET /api/bridges?limit=40`.
+- **Entities** — *"where else do I talk about Mercedes?"* Ranked entity chips (people, orgs, concepts) → the notes that mention them, by mention weight. Reads an optional sqlite graph db (see below). Endpoints: `GET /api/entities?q=&limit=`, `GET /api/entity-notes?entity=`.
 
 ### Enabling synthesis (needs an LLM)
 
-Embeddings/search/clustering/graph-queries are fully local. Only **synthesis generation** and **building the graph** need an LLM. Point at a local OpenAI-compatible server to keep notes private:
+Embeddings/search/clustering/bridges/entities are fully local. Only **synthesis generation** needs an LLM. Point at a local OpenAI-compatible server to keep notes private:
 
 ```bash
 # LM Studio / Ollama (zero API cost, notes stay local):
@@ -65,13 +66,9 @@ SYNTH_BASE_URL=http://localhost:1234/v1 SYNTH_MODEL=<loaded-model> OPENAI_API_KE
 # …or real OpenAI: set a funded OPENAI_API_KEY (defaults to gpt-4o-mini).
 ```
 
-### The knowledge graph
+### The entity graph (optional)
 
-The graph is built by the companion [`exp-notes-indexing`](https://github.com/connerkward/exp-notes-indexing) pipeline (Apple Notes → entity/relationship extraction → Kuzu). The web app reads it via `graph/server.py`; configure with `GRAPH_DB` (path to the `.kuzu`), `GRAPH_PY` (python with `kuzu` installed), `GRAPH_PORT`. If no graph is present the UI simply omits the graph panel.
-
-### Bridges (experimental — lives on the `bridges` branch)
-
-Swanson-ABC literature-based discovery over your own notes: find pairs (A, C) that are **not** directly similar but are both strongly similar to a shared bridge note B — connections the corpus only makes through an intermediary. Pure arithmetic over the existing embeddings (score = sim(A,B)·sim(B,C)·(1−sim(A,C)); cross-folder, no shared tags/wikilinks; thresholds auto-relax). No LLM, $0, cached in memory after the first run. Exposed as the `bridge-notes` MCP tool (`{limit?, folder?}`), `GET /api/bridges?limit=40`, and a **bridges** tab in the web UI.
+The entity layer reads `~/.mcp-apple-notes/layered_graph.db` (override with `LAYERED_DB`) — a plain sqlite file produced by the companion [`exp-notes-indexing`](https://github.com/connerkward/exp-notes-indexing) benchmark harness (`layered_graph.py`). No extra dependencies (bun ships `bun:sqlite`); if the file is absent the entity tools and tab simply report how to generate it.
 
 ## Installation
 
@@ -100,6 +97,22 @@ bun install
 
 4. Restart Claude Desktop and ask: *"Index my Apple Notes"*.
 
+### Claude Code / CLI registration
+
+```json
+// .mcp.json (project) or `claude mcp add apple-notes -- bun /path/to/mcp-apple-notes/index.ts --stdio`
+{
+  "mcpServers": {
+    "apple-notes": {
+      "command": "bun",
+      "args": ["/path/to/mcp-apple-notes/index.ts", "--stdio"]
+    }
+  }
+}
+```
+
+The same bridges/entities tools power the web UI tabs at the local app (`bun index.ts` → http://localhost:3741/); the entity graph db is optional, generated by the `exp-notes-indexing` benchmark harness.
+
 ## Tools
 
 | Tool | Description |
@@ -113,6 +126,9 @@ bun install
 | `list-tags` | All `#hashtags` across notes, sorted by frequency |
 | `search-by-tag` | Notes containing a specific hashtag |
 | `related-notes` | Related notes via shared tags, `[[wikilinks]]`, and vector similarity |
+| `bridge-notes` | Swanson-ABC bridges: non-similar note pairs connected via a shared intermediary; optional `folder`, `limit` |
+| `entity-notes` | Notes mentioning an entity (e.g. "Mercedes"), by mention weight — needs the optional entity graph db |
+| `list-entities` | Entities ranked by mention count; optional substring `query`, `limit` |
 | `get-tables` | Extract pipe/tab-separated tables from a note |
 | `create-note` | Create a note |
 | `update-note` | Edit an existing note |

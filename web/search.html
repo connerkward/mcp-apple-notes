@@ -63,20 +63,6 @@
   .card .snippet { color:var(--fg); font-size:13.5px; opacity:.92; white-space:pre-wrap;
                    word-break:break-word; }
   .card mark { background:var(--hi); color:inherit; border-radius:2px; padding:0 1px; }
-  .card .relbtn { margin-top:8px; font-size:12px; color:var(--accent); background:none; border:none;
-                  padding:0; cursor:pointer; font-family:var(--sans); }
-  .card .relbtn:hover { text-decoration:underline; }
-  .relpanel { margin-top:8px; padding:8px 10px; background:var(--bg); border:1px solid var(--line);
-              border-radius:8px; font-size:13px; display:none; }
-  .relpanel.open { display:block; }
-  .relpanel .ents { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:8px; }
-  .relpanel .ent { font-size:11px; background:var(--paper); border:1px solid var(--line);
-                   border-radius:20px; padding:2px 9px; cursor:pointer; }
-  .relpanel .ent:hover { border-color:var(--accent); }
-  .relpanel .rel { padding:3px 0; cursor:pointer; }
-  .relpanel .rel:hover { color:var(--accent); }
-  .relpanel .rel .sh { color:var(--mut); font-size:11px; }
-  .relpanel .none { color:var(--mut); font-style:italic; }
 
   .empty { text-align:center; color:var(--mut); padding:48px 0; font-style:italic; }
   .spinner { width:14px; height:14px; border:2px solid var(--line);
@@ -149,6 +135,20 @@
                 color:var(--mut); cursor:pointer; }
   .blink .via:hover { color:var(--accent); }
   .bscore { flex:0 0 auto; color:var(--mut); font-size:11px; font-variant-numeric:tabular-nums; }
+
+  /* entities view */
+  #entView { flex:1 1 auto; display:none; flex-direction:column; min-height:0; }
+  #entView.on { display:flex; }
+  .entbar { display:flex; gap:10px; padding:18px 24px 6px; max-width:920px; width:100%; margin:0 auto; }
+  #entQ { flex:1 1 auto; font:16px var(--sans); color:var(--fg); background:var(--card);
+          border:1px solid var(--line); border-radius:10px; padding:12px 14px; outline:none; }
+  #entQ:focus { border-color:var(--accent); }
+  .chips { display:flex; flex-wrap:wrap; gap:7px; max-width:920px; margin:0 auto 16px; }
+  .chip { font-size:12.5px; background:var(--card); border:1px solid var(--line); border-radius:20px;
+          padding:4px 12px; cursor:pointer; }
+  .chip:hover { border-color:var(--accent); }
+  .chip.on { border-color:var(--accent); background:var(--paper); }
+  .chip .ct { color:var(--mut); font-size:11px; }
 </style>
 </head>
 <body>
@@ -159,6 +159,7 @@
       <button id="tabMap">map</button>
       <button id="tabSynth">synthesize</button>
       <button id="tabBridges">bridges</button>
+      <button id="tabEnts">entities</button>
     </div>
     <div class="sp"></div>
     <span id="status">loading…</span>
@@ -202,6 +203,17 @@
     <main>
       <div class="meta" id="bridgesMeta"></div>
       <div class="results" id="bridgesList"></div>
+    </main>
+  </div>
+
+  <div id="entView">
+    <div class="entbar">
+      <input id="entQ" type="search" placeholder="filter entities — people, places, concepts…" autocomplete="off" />
+    </div>
+    <main>
+      <div class="meta" id="entMeta"></div>
+      <div class="chips" id="entChips"></div>
+      <div class="results" id="entNotes"></div>
     </main>
   </div>
 
@@ -272,34 +284,8 @@ function render(results, q, ms){
         ${r.modified ? `<span>${fmtDate(r.modified)}</span>` : ""}
       </div>
       <div class="snippet">${highlight(r.snippet || "", q)}</div>
-      ${graphAvailable ? `<button class="relbtn" data-title="${encodeURIComponent(r.title||"")}">related (graph) ↘</button><div class="relpanel"></div>` : ""}
     </div>`).join("");
 }
-
-// graph-backed "related notes" — expand under a card, powered by the Kuzu sidecar
-let graphAvailable = false;
-async function checkGraph(){
-  try { const r = await fetch("/api/graph-status"); if (r.ok){ const s = await r.json(); graphAvailable = !!s.ok;
-    if (graphAvailable) statusEl.title = (statusEl.title||"") + ` · graph: ${s.episodes} notes, ${s.entities} entities`; } }
-  catch { graphAvailable = false; }
-}
-resEl.addEventListener("click", async e => {
-  const ent = e.target.closest(".ent");
-  if (ent){ setView("search"); qEl.value = ent.dataset.name; doSearch(); return; }
-  const rel = e.target.closest(".rel");
-  if (rel){ setView("search"); qEl.value = rel.dataset.note; doSearch(); return; }
-  const btn = e.target.closest(".relbtn");
-  if (!btn) return;
-  const panel = btn.nextElementSibling;
-  if (panel.classList.contains("open")){ panel.classList.remove("open"); return; }
-  panel.classList.add("open"); panel.innerHTML = `<span class="spinner"></span>`;
-  try {
-    const d = await (await fetch("/api/related?title=" + btn.dataset.title)).json();
-    const ents = (d.entities||[]).map(en => `<span class="ent" data-name="${esc(en)}">${esc(en)}</span>`).join("");
-    const rels = (d.related||[]).map(x => `<div class="rel" data-note="${esc(x.note)}">${esc(x.note)} <span class="sh">· ${x.shared} shared</span></div>`).join("");
-    panel.innerHTML = (ents?`<div class="ents">${ents}</div>`:"") + (rels || `<div class="none">no graph connections (this note may not be in the ${" "}indexed subset yet)</div>`);
-  } catch(err){ panel.innerHTML = `<div class="none">graph error</div>`; }
-});
 
 // debounce
 let t; function onInput(){ clearTimeout(t); t = setTimeout(doSearch, 180); }
@@ -510,27 +496,74 @@ bridgesList.addEventListener("click", e => {
   setView("search"); qEl.value = decodeURIComponent(t.dataset.title); doSearch();
 });
 
+// ---------- entities ----------
+const entView = $("#entView"), tabEnts = $("#tabEnts"), entQ = $("#entQ"),
+      entMeta = $("#entMeta"), entChips = $("#entChips"), entNotes = $("#entNotes");
+let entsLoaded = false;
+async function loadEntities(){
+  entMeta.innerHTML = `<span class="spinner"></span> loading entities…`;
+  try {
+    const q = entQ.value.trim();
+    const r = await fetch("/api/entities?limit=60" + (q ? "&q=" + encodeURIComponent(q) : ""));
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ("error " + r.status));
+    entMeta.textContent = `${d.entities.length} entities by mention count — click one to see its notes`;
+    entChips.innerHTML = d.entities.map(e =>
+      `<span class="chip" data-ent="${encodeURIComponent(e.label)}" title="${esc(e.type)}">${esc(e.label)} <span class="ct">${e.count}</span></span>`
+    ).join("") || `<div class="empty">no entities match.</div>`;
+  } catch(e){ entMeta.textContent = "entities failed: " + e.message; entChips.innerHTML = ""; }
+}
+async function loadEntityNotes(entity){
+  entNotes.innerHTML = `<span class="spinner"></span>`;
+  try {
+    const r = await fetch("/api/entity-notes?entity=" + entity);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ("error " + r.status));
+    if (d.error){ entNotes.innerHTML = `<div class="empty">${esc(d.error)}</div>`; return; }
+    entNotes.innerHTML = `<div class="meta">${d.notes.length} notes mention <b>${esc(d.entity)}</b> (${esc(d.type)})</div>` +
+      d.notes.map(n => `
+      <div class="card" data-title="${encodeURIComponent(n.title||"")}" style="cursor:pointer">
+        <div class="title">${esc(n.title) || "(untitled)"}</div>
+        <div class="sub">${n.folder ? `<span class="folder">${esc(n.folder)}</span>` : ""}<span>weight ${n.weight}</span></div>
+      </div>`).join("");
+  } catch(e){ entNotes.innerHTML = `<div class="empty">failed: ${esc(e.message)}</div>`; }
+}
+entChips.addEventListener("click", e => {
+  const c = e.target.closest(".chip"); if (!c) return;
+  entChips.querySelectorAll(".chip").forEach(x => x.classList.toggle("on", x === c));
+  loadEntityNotes(c.dataset.ent);
+});
+entNotes.addEventListener("click", e => {
+  const t = e.target.closest("[data-title]"); if (!t) return;
+  setView("search"); qEl.value = decodeURIComponent(t.dataset.title); doSearch();
+});
+let entT; entQ.addEventListener("input", () => { clearTimeout(entT); entT = setTimeout(loadEntities, 200); });
+
 function setView(v){
   tabSearch.classList.toggle("on", v==="search");
   tabMap.classList.toggle("on", v==="map");
   tabSynth.classList.toggle("on", v==="synth");
   tabBridges.classList.toggle("on", v==="bridges");
+  tabEnts.classList.toggle("on", v==="entities");
   searchView.style.display = v==="search" ? "flex" : "none";
   mapView.classList.toggle("on", v==="map");
   synthView.classList.toggle("on", v==="synth");
   bridgesView.classList.toggle("on", v==="bridges");
+  entView.classList.toggle("on", v==="entities");
   if (v==="map"){ if (!mapLoaded){ mapLoaded = true; loadClusters(+kSlider.value); } else resize(); }
   if (v==="bridges" && !bridgesLoaded){ bridgesLoaded = true; loadBridges(); }
+  if (v==="entities" && !entsLoaded){ entsLoaded = true; loadEntities(); }
   if (v==="search" && qEl) qEl.focus();
   if (v==="synth") synthQ.focus();
+  if (v==="entities") entQ.focus();
 }
 tabSearch.addEventListener("click", () => setView("search"));
 tabMap.addEventListener("click", () => setView("map"));
 tabSynth.addEventListener("click", () => setView("synth"));
 tabBridges.addEventListener("click", () => setView("bridges"));
+tabEnts.addEventListener("click", () => setView("entities"));
 
 refreshStatus();
-checkGraph();
 </script>
 </body>
 </html>

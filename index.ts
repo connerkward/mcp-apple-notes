@@ -12,34 +12,60 @@ import http from "node:http";
 import { computeClusters } from "./clustering";
 import { computeBridges } from "./bridges";
 import { synthesize } from "./synthesize";
-import { spawn } from "node:child_process";
 
-// Knowledge-graph sidecar (optional). The Graphiti/Kuzu graph is queried by a tiny
-// read-only Python sidecar (Kuzu is single-process); we auto-spawn it if the graph
-// exists and proxy /api/related to it. Graph QUERIES need no LLM/key.
-const GRAPH_PORT = process.env.GRAPH_PORT || "3743";
-const GRAPH_PY = process.env.GRAPH_PY || path.join(os.homedir(), "dev", "exp-notes-indexing", ".venv", "bin", "python");
-let graphUp = false;
-const startGraphSidecar = () => {
-  const fsmod = require("node:fs");
-  if (!fsmod.existsSync(GRAPH_PY)) {
-    console.error(`Graph sidecar skipped (no python with falkordb at ${GRAPH_PY}).`);
-    return;
-  }
-  const proc = spawn(GRAPH_PY, [path.join(import.meta.dirname, "graph", "server.py")], {
-    env: { ...process.env, GRAPH_PORT },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  proc.stdout.on("data", (d) => console.error(`[graph] ${d}`.trim()));
-  proc.stderr.on("data", (d) => console.error(`[graph] ${d}`.trim()));
-  proc.on("exit", (code) => { graphUp = false; console.error(`[graph] sidecar exited (${code})`); });
-  graphUp = true;
-  process.on("exit", () => proc.kill());
+// Entity layer (optional, zero deps — bun:sqlite). A sibling benchmark harness
+// (exp-notes-indexing/layered_graph.py) writes ~/.mcp-apple-notes/layered_graph.db:
+//   nodes(id, kind, label, folder)  — kinds: entity/note/folder/tag/theme;
+//                                     for entity nodes, `folder` holds the entity TYPE
+//   edges(src, dst, kind, weight)   — mentions edges are src=note → dst=entity
+// If the file is absent the entity tools degrade to a helpful message.
+const LAYERED_DB = process.env.LAYERED_DB || path.join(os.homedir(), ".mcp-apple-notes", "layered_graph.db");
+const NO_GRAPH_DB_MSG = `No entity graph db at ${LAYERED_DB} — generate it with the exp-notes-indexing benchmark harness (layered_graph.py), or set LAYERED_DB.`;
+
+const withLayeredDb = <T>(fn: (db: Database) => T): T | null => {
+  if (!require("node:fs").existsSync(LAYERED_DB)) return null;
+  const db = new Database(LAYERED_DB, { readonly: true });
+  try { return fn(db); } finally { db.close(); }
 };
-const graphFetch = async (apiPath: string) => {
-  const r = await fetch(`http://127.0.0.1:${GRAPH_PORT}${apiPath}`);
-  return await r.json();
+
+// Resolve a user-supplied entity name → best matching entity node.
+// Exact (case-insensitive) → prefix → contains; ties broken by mention count.
+const resolveEntity = (db: Database, name: string): { id: string; label: string; type: string } | null => {
+  const pick = (where: string) => db.query<any, [string]>(`
+    SELECT n.id, n.label, n.folder AS type, COUNT(e.src) AS cnt
+    FROM nodes n LEFT JOIN edges e ON e.dst = n.id AND e.kind = 'mentions'
+    WHERE n.kind = 'entity' AND ${where}
+    GROUP BY n.id ORDER BY cnt DESC LIMIT 1
+  `).get(name);
+  return pick("lower(n.label) = lower(?)")
+      ?? pick("n.label LIKE ? || '%'")
+      ?? pick("n.label LIKE '%' || ? || '%'")
+      ?? null;
 };
+
+const entityNotes = (entity: string) => withLayeredDb((db) => {
+  const ent = resolveEntity(db, entity);
+  if (!ent) return { error: `No entity matching "${entity}" in the graph.` };
+  const notes = db.query<any, [string]>(`
+    SELECT n.label AS title, n.folder AS folder, ROUND(e.weight, 4) AS weight
+    FROM edges e JOIN nodes n ON n.id = e.src
+    WHERE e.kind = 'mentions' AND e.dst = ?
+    ORDER BY e.weight DESC
+  `).all(ent.id);
+  return { entity: ent.label, type: ent.type, notes };
+});
+
+const listEntities = (query?: string, limit = 30) => withLayeredDb((db) => {
+  const filter = query ? "AND n.label LIKE '%' || ? || '%'" : "";
+  const params: any[] = query ? [query, limit] : [limit];
+  const entities = db.query<any, any[]>(`
+    SELECT n.label, n.folder AS type, COUNT(e.src) AS count
+    FROM nodes n JOIN edges e ON e.dst = n.id AND e.kind = 'mentions'
+    WHERE n.kind = 'entity' AND LENGTH(n.label) > 3 ${filter}
+    GROUP BY n.id ORDER BY count DESC LIMIT ?
+  `).all(...params);
+  return { entities };
+});
 
 // LLM config for synthesis (optional). Read once; key is never logged.
 // Works with a LOCAL OpenAI-compatible server (LM Studio / Ollama) or real OpenAI:
@@ -1023,6 +1049,23 @@ server.tool("bridge-notes", {
   return createTextResponse(JSON.stringify(result));
 });
 
+server.tool("entity-notes", {
+  entity: z.string().describe("Entity name, e.g. 'Mercedes' — case-insensitive, prefix/contains fallback"),
+}, async ({ entity }) => {
+  const result = entityNotes(entity);
+  if (result === null) return createTextResponse(NO_GRAPH_DB_MSG);
+  return createTextResponse(JSON.stringify(result));
+});
+
+server.tool("list-entities", {
+  query: z.string().optional().describe("Substring filter on entity labels"),
+  limit: z.number().int().min(1).max(200).optional().describe("Max entities (default 30)"),
+}, async ({ query, limit = 30 }) => {
+  const result = listEntities(query, limit);
+  if (result === null) return createTextResponse(NO_GRAPH_DB_MSG);
+  return createTextResponse(JSON.stringify(result));
+});
+
 server.tool("get-tables", { title: z.string().describe("Exact note title") }, async ({ title }) => {
   const note = await getNoteDetailsByTitle(title);
   if (!note?.title) return createTextResponse(JSON.stringify({ error: `Note not found: "${title}"` }));
@@ -1273,14 +1316,26 @@ if (process.argv.includes("--stdio")) {
       return;
     }
 
-    // ---- knowledge-graph proxy (Graphiti/Kuzu via sidecar; no LLM needed) ----
-    if (req.method === "GET" && (u.pathname === "/api/graph-status" || u.pathname === "/api/related" || u.pathname === "/api/graph-entity")) {
-      if (!graphUp) { sendJson(503, { error: "graph not available (no indexed graph / sidecar down)" }); return; }
+    // ---- entity layer (bun:sqlite over the optional layered graph db) ----
+    if (req.method === "GET" && u.pathname === "/api/entities") {
+      const q = u.searchParams.get("q")?.trim() || undefined;
+      const limit = Math.min(Math.max(parseInt(u.searchParams.get("limit") ?? "30") || 30, 1), 200);
       try {
-        if (u.pathname === "/api/graph-status") { sendJson(200, await graphFetch("/health")); return; }
-        if (u.pathname === "/api/related") { sendJson(200, await graphFetch("/related?title=" + encodeURIComponent(u.searchParams.get("title") ?? ""))); return; }
-        sendJson(200, await graphFetch("/entity?name=" + encodeURIComponent(u.searchParams.get("name") ?? "")));
-      } catch (e: any) { sendJson(502, { error: "graph sidecar error: " + String(e?.message ?? e) }); }
+        const result = listEntities(q, limit);
+        if (result === null) { sendJson(503, { error: NO_GRAPH_DB_MSG }); return; }
+        sendJson(200, result);
+      } catch (e: any) { sendJson(500, { error: String(e?.message ?? e) }); }
+      return;
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/entity-notes") {
+      const entity = u.searchParams.get("entity")?.trim();
+      if (!entity) { sendJson(400, { error: "missing entity" }); return; }
+      try {
+        const result = entityNotes(entity);
+        if (result === null) { sendJson(503, { error: NO_GRAPH_DB_MSG }); return; }
+        sendJson(200, result);
+      } catch (e: any) { sendJson(500, { error: String(e?.message ?? e) }); }
       return;
     }
 
@@ -1371,7 +1426,6 @@ if (process.argv.includes("--stdio")) {
     console.error(`MCP endpoint:           http://localhost:${PORT}/mcp`);
     console.error(`Expose with: npx cloudflared tunnel --url http://localhost:${PORT}`);
   });
-  startGraphSidecar();
 }
 
 } // end import.meta.main

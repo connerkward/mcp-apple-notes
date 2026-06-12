@@ -188,6 +188,35 @@ export async function computeBridges({ table, embedBatch, limit = 20, folder }: 
     tHigh: cache.tHigh,
     tLow: cache.tLow,
     ms: Math.round(performance.now() - t0),
-    bridges: pool.slice(0, limit),
+    bridges: selectWithHubPenalty(pool, limit),
   };
+}
+
+// Greedy hub-penalized selection (benchmark finding: top-by-raw-score lets one
+// "hub" note appear as an endpoint in 4+ bridges, crowding out variety).
+// Each round, pick the candidate maximizing det / sqrt(1 + appearances(A) + appearances(C)),
+// and hard-cap any note at 2 appearances as an endpoint in the returned list.
+export function selectWithHubPenalty(pool: Bridge[], limit: number, cap = 2): Bridge[] {
+  const appearances = new Map<string, number>();
+  const used = new Set<number>();
+  const out: Bridge[] = [];
+  while (out.length < limit) {
+    let bestIdx = -1, bestScore = -Infinity;
+    for (let i = 0; i < pool.length; i++) {
+      if (used.has(i)) continue;
+      const b = pool[i];
+      const aN = appearances.get(b.a.title) ?? 0;
+      const cN = appearances.get(b.c.title) ?? 0;
+      if (aN >= cap || cN >= cap) continue;
+      const s = b.score / Math.sqrt(1 + aN + cN);
+      if (s > bestScore) { bestScore = s; bestIdx = i; }
+    }
+    if (bestIdx < 0) break;
+    used.add(bestIdx);
+    const b = pool[bestIdx];
+    appearances.set(b.a.title, (appearances.get(b.a.title) ?? 0) + 1);
+    appearances.set(b.c.title, (appearances.get(b.c.title) ?? 0) + 1);
+    out.push(b);
+  }
+  return out;
 }
