@@ -133,6 +133,22 @@
   .src .t { font-weight:600; }
   .src .m { color:var(--mut); font-size:11px; }
   .src .x { color:var(--mut); font-size:12px; opacity:.85; }
+
+  /* bridges view */
+  #bridgesView { flex:1 1 auto; display:none; flex-direction:column; min-height:0; }
+  #bridgesView.on { display:flex; }
+  .bridge { display:flex; align-items:center; gap:14px; background:var(--card); border:1px solid var(--line);
+            border-radius:12px; padding:12px 16px; margin:10px 0; }
+  .bpill { flex:0 1 34%; min-width:0; background:var(--paper); border:1px solid; border-radius:10px;
+           padding:6px 12px; cursor:pointer; }
+  .bpill:hover { background:var(--bg); }
+  .bpill b { display:block; font:600 13.5px/1.3 var(--serif); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .bpill .f { display:block; font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .blink { flex:1 1 auto; min-width:80px; border-top:1px dashed var(--mut); text-align:center; }
+  .blink .via { position:relative; top:-0.85em; background:var(--card); padding:0 7px; font-size:11px;
+                color:var(--mut); cursor:pointer; }
+  .blink .via:hover { color:var(--accent); }
+  .bscore { flex:0 0 auto; color:var(--mut); font-size:11px; font-variant-numeric:tabular-nums; }
 </style>
 </head>
 <body>
@@ -142,6 +158,7 @@
       <button id="tabSearch" class="on">search</button>
       <button id="tabMap">map</button>
       <button id="tabSynth">synthesize</button>
+      <button id="tabBridges">bridges</button>
     </div>
     <div class="sp"></div>
     <span id="status">loading…</span>
@@ -179,6 +196,13 @@
       <h3>topics</h3>
       <div id="legendRows"></div>
     </div>
+  </div>
+
+  <div id="bridgesView">
+    <main>
+      <div class="meta" id="bridgesMeta"></div>
+      <div class="results" id="bridgesList"></div>
+    </main>
   </div>
 
   <div id="synthView">
@@ -455,20 +479,55 @@ async function runSynth(){
 synthBtn.addEventListener("click", runSynth);
 synthQ.addEventListener("keydown", e => { if (e.key === "Enter") runSynth(); });
 
+// ---------- bridges ----------
+const bridgesView = $("#bridgesView"), tabBridges = $("#tabBridges"),
+      bridgesMeta = $("#bridgesMeta"), bridgesList = $("#bridgesList");
+let bridgesLoaded = false;
+function folderColor(f){ let h=0; const s=f||"—"; for (let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))>>>0; return `hsl(${h%360} 48% 44%)`; }
+function bpill(n){
+  const col = folderColor(n.folder);
+  return `<span class="bpill" data-title="${encodeURIComponent(n.title||"")}" style="border-color:${col}" title="${esc(n.title)}">
+    <b>${esc(n.title) || "(untitled)"}</b><span class="f" style="color:${col}">${esc(n.folder) || "—"}</span></span>`;
+}
+async function loadBridges(){
+  bridgesMeta.innerHTML = `<span class="spinner"></span> mining bridges… (first run embeds every note, can take a few minutes)`;
+  try {
+    const r = await fetch("/api/bridges?limit=40"); const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ("error " + r.status));
+    bridgesMeta.textContent = `${d.bridges.length} of ${d.candidates} bridges · ${d.notes.toLocaleString()} notes · via-sim ≥ ${d.tHigh}, direct ≤ ${d.tLow} · ${d.ms} ms`;
+    bridgesList.innerHTML = d.bridges.map(b => `
+      <div class="bridge" title="sim a↔b ${b.sims.ab} · b↔c ${b.sims.bc} · a↔c ${b.sims.ac}">
+        ${bpill(b.a)}
+        <span class="blink"><span class="via" data-title="${encodeURIComponent(b.b.title||"")}">via ${esc(b.b.title)}</span></span>
+        ${bpill(b.c)}
+        <span class="bscore">${b.score.toFixed(3)}</span>
+      </div>`).join("") || `<div class="empty">no bridges found — index some notes first.</div>`;
+  } catch(e){ bridgesMeta.textContent = "bridges failed: " + e.message; }
+}
+bridgesList.addEventListener("click", e => {
+  const t = e.target.closest("[data-title]");
+  if (!t) return;
+  setView("search"); qEl.value = decodeURIComponent(t.dataset.title); doSearch();
+});
+
 function setView(v){
   tabSearch.classList.toggle("on", v==="search");
   tabMap.classList.toggle("on", v==="map");
   tabSynth.classList.toggle("on", v==="synth");
+  tabBridges.classList.toggle("on", v==="bridges");
   searchView.style.display = v==="search" ? "flex" : "none";
   mapView.classList.toggle("on", v==="map");
   synthView.classList.toggle("on", v==="synth");
+  bridgesView.classList.toggle("on", v==="bridges");
   if (v==="map"){ if (!mapLoaded){ mapLoaded = true; loadClusters(+kSlider.value); } else resize(); }
+  if (v==="bridges" && !bridgesLoaded){ bridgesLoaded = true; loadBridges(); }
   if (v==="search" && qEl) qEl.focus();
   if (v==="synth") synthQ.focus();
 }
 tabSearch.addEventListener("click", () => setView("search"));
 tabMap.addEventListener("click", () => setView("map"));
 tabSynth.addEventListener("click", () => setView("synth"));
+tabBridges.addEventListener("click", () => setView("bridges"));
 
 refreshStatus();
 checkGraph();

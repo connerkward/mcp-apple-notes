@@ -69,6 +69,10 @@ SYNTH_BASE_URL=http://localhost:1234/v1 SYNTH_MODEL=<loaded-model> OPENAI_API_KE
 
 The graph is built by the companion [`exp-notes-indexing`](https://github.com/connerkward/exp-notes-indexing) pipeline (Apple Notes → entity/relationship extraction → Kuzu). The web app reads it via `graph/server.py`; configure with `GRAPH_DB` (path to the `.kuzu`), `GRAPH_PY` (python with `kuzu` installed), `GRAPH_PORT`. If no graph is present the UI simply omits the graph panel.
 
+### Bridges (experimental — lives on the `bridges` branch)
+
+Swanson-ABC literature-based discovery over your own notes: find pairs (A, C) that are **not** directly similar but are both strongly similar to a shared bridge note B — connections the corpus only makes through an intermediary. Pure arithmetic over the existing embeddings (score = sim(A,B)·sim(B,C)·(1−sim(A,C)); cross-folder, no shared tags/wikilinks; thresholds auto-relax). No LLM, $0, cached in memory after the first run. Exposed as the `bridge-notes` MCP tool (`{limit?, folder?}`), `GET /api/bridges?limit=40`, and a **bridges** tab in the web UI.
+
 ## Installation
 
 1. Clone and install:
