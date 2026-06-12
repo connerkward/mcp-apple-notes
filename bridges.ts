@@ -8,8 +8,9 @@
 // embedBatch the caller provides (same pattern as synthesize.ts), NOT averaged
 // from the stored chunk vectors: the table's stored `vector` column embeds the
 // wrong source field (same-folder notes have identical vectors — see report on
-// the bridges branch), so it carries no per-note meaning. Mined candidates are
-// cached in memory by rowCount; only the first call pays the embedding cost.
+// the bridges branch), so it carries no per-note meaning. Mining is expensive
+// (~2 min embedding the corpus); callers cache the mined pool to disk keyed by
+// a corpus fingerprint (see index.ts) and call selectBridges() per request.
 
 export type Bridge = {
   a: { title: string; folder: string };
@@ -28,10 +29,15 @@ export type BridgeResult = {
   bridges: Bridge[];
 };
 
+export type MinedBridges = {
+  notes: number;
+  tHigh: number;
+  tLow: number;
+  all: Bridge[];
+};
+
 type MinedNote = { title: string; folder: string; titleLc: string; markers: Set<string> };
 type Candidate = { det: number; a: number; b: number; c: number; ab: number; bc: number; ac: number };
-
-let cache: { key: string; notes: number; tHigh: number; tLow: number; all: Bridge[] } | null = null;
 
 // Same patterns as extractTags/extractWikilinks in index.ts (kept local so this
 // module stays import-free of the entrypoint, like clustering.ts).
@@ -163,30 +169,34 @@ async function mineAll(notesTable: any, embedBatch: (arr: string[]) => Promise<n
   return { notes: n, tHigh: round(tHigh), tLow: round(tLow), all };
 }
 
-export async function computeBridges({ table, embedBatch, limit = 20, folder }: {
-  table: any;
-  embedBatch: (arr: string[]) => Promise<number[][]>;
+// Full mine: embeds every note and returns the complete candidate pool.
+// Expensive — callers persist the result and serve via selectBridges().
+export async function mineBridges(
+  table: any,
+  embedBatch: (arr: string[]) => Promise<number[][]>
+): Promise<MinedBridges> {
+  return await mineAll(table, embedBatch);
+}
+
+// Cheap per-request selection over a mined pool (cached or fresh).
+export function selectBridges(mined: MinedBridges, { limit = 20, folder }: {
   limit?: number;
   folder?: string;
-}): Promise<BridgeResult> {
+} = {}): BridgeResult {
   const t0 = performance.now();
-  const total = await table.countRows().catch(() => 0);
-  const key = String(total);
-  if (!cache || cache.key !== key) cache = { key, ...(await mineAll(table, embedBatch)) };
-
   // Folder segment matcher — same semantics as searchAndCombineResults in index.ts
   const matchesFolder = folder
     ? (p: string) => p === folder || p.startsWith(folder + "/") || p.endsWith("/" + folder) || p.includes("/" + folder + "/")
     : null;
   const pool = matchesFolder
-    ? cache.all.filter(b => matchesFolder(b.a.folder) || matchesFolder(b.c.folder))
-    : cache.all;
+    ? mined.all.filter(b => matchesFolder(b.a.folder) || matchesFolder(b.c.folder))
+    : mined.all;
 
   return {
-    notes: cache.notes,
-    candidates: cache.all.length,
-    tHigh: cache.tHigh,
-    tLow: cache.tLow,
+    notes: mined.notes,
+    candidates: mined.all.length,
+    tHigh: mined.tHigh,
+    tLow: mined.tLow,
     ms: Math.round(performance.now() - t0),
     bridges: selectWithHubPenalty(pool, limit),
   };

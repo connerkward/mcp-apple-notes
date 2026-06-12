@@ -149,13 +149,43 @@
   .chip:hover { border-color:var(--accent); }
   .chip.on { border-color:var(--accent); background:var(--paper); }
   .chip .ct { color:var(--mut); font-size:11px; }
+
+  /* feed view */
+  #feedView { flex:1 1 auto; display:none; flex-direction:column; min-height:0; }
+  #feedView.on { display:flex; }
+  .fcard { background:var(--card); border:1px solid var(--line); border-radius:12px;
+           padding:13px 16px; margin:10px 0; }
+  .fhead { display:flex; align-items:baseline; gap:10px; }
+  .fkind { font-size:10.5px; letter-spacing:.06em; text-transform:uppercase; border-radius:5px;
+           padding:2px 7px; flex:0 0 auto; }
+  .fkind.bridge { background:color-mix(in srgb, var(--accent) 16%, transparent); color:var(--accent); }
+  .fkind.abstraction_pair { background:color-mix(in srgb, #b06c2f 18%, transparent); color:#b06c2f; }
+  .fkind.entity_overlap { background:color-mix(in srgb, #5b6ec4 18%, transparent); color:#7282cc; }
+  .fcard .title { font:600 15px/1.35 var(--serif); flex:1 1 auto; min-width:0; }
+  .fev { font-size:13px; color:var(--fg); opacity:.88; white-space:pre-wrap; word-break:break-word;
+         border-left:2px solid var(--line); padding-left:10px; margin:8px 0 9px; }
+  .fnotes { display:flex; flex-wrap:wrap; gap:6px; }
+  .fnote { font-size:11.5px; background:var(--paper); border:1px solid var(--line); border-radius:14px;
+           padding:2px 10px; cursor:pointer; max-width:34ch; overflow:hidden; text-overflow:ellipsis;
+           white-space:nowrap; }
+  .fnote:hover { border-color:var(--accent); }
+  .fnote .ff { color:var(--mut); }
+  .fvotes { display:flex; gap:6px; align-items:center; margin-left:auto; flex:0 0 auto; }
+  .fvotes button { padding:3px 9px; font-size:13px; border-radius:6px; }
+  .fvotes button.sel { border-color:var(--accent); background:var(--paper); }
+  .fvotes button:disabled { opacity:.45; }
+  .fscore { color:var(--mut); font-size:10.5px; font-variant-numeric:tabular-nums; }
+  .more { display:block; margin:16px auto 4px; padding:8px 22px; }
+  .pill { font-size:11px; color:var(--accent); border:1px solid var(--accent); border-radius:12px;
+          padding:1px 9px; margin-left:8px; opacity:.85; }
 </style>
 </head>
 <body>
   <header>
     <h1>apple notes</h1>
     <div class="nav">
-      <button id="tabSearch" class="on">search</button>
+      <button id="tabFeed" class="on">feed</button>
+      <button id="tabSearch">search</button>
       <button id="tabMap">map</button>
       <button id="tabSynth">synthesize</button>
       <button id="tabBridges">bridges</button>
@@ -165,6 +195,14 @@
     <span id="status">loading…</span>
     <button id="indexBtn" title="Re-index notes from Apple Notes">index</button>
   </header>
+
+  <div id="feedView">
+    <main>
+      <div class="meta" id="feedMeta"></div>
+      <div class="results" id="feedList"></div>
+      <button class="more" id="feedMore" style="display:none">show more</button>
+    </main>
+  </div>
 
   <div id="searchView">
     <div class="searchbar">
@@ -319,6 +357,59 @@ async function pollJob(jobId){
 }
 indexBtn.addEventListener("click", startIndex);
 
+// ---------- feed ----------
+const feedView = $("#feedView"), tabFeed = $("#tabFeed"),
+      feedMeta = $("#feedMeta"), feedList = $("#feedList"), feedMore = $("#feedMore");
+let feedLoaded = false, feedOffset = 0, feedTotal = 0;
+const KIND_LABEL = { bridge:"bridge", abstraction_pair:"same move", entity_overlap:"thread" };
+function feedCard(it){
+  const voted = it.voted === 1 ? "up" : it.voted === -1 ? "down" : "";
+  return `<div class="fcard" data-id="${encodeURIComponent(it.id)}">
+    <div class="fhead">
+      <span class="fkind ${it.kind}">${KIND_LABEL[it.kind] || it.kind}</span>
+      <span class="title">${esc(it.headline)}</span>
+      <span class="fvotes">
+        <span class="fscore">${(it.score ?? 0).toFixed(3)}</span>
+        <button class="vup ${voted==="up"?"sel":""}" title="more like this" ${voted?"disabled":""}>👍</button>
+        <button class="vdn ${voted==="down"?"sel":""}" title="less like this" ${voted?"disabled":""}>👎</button>
+      </span>
+    </div>
+    <div class="fev">${esc(it.evidence)}</div>
+    <div class="fnotes">${(it.notes||[]).map(n =>
+      `<span class="fnote" data-title="${encodeURIComponent(n.title||"")}" title="${esc(n.title)}">${esc(n.title)}${n.folder?` <span class="ff">· ${esc(n.folder)}</span>`:""}</span>`).join("")}</div>
+  </div>`;
+}
+async function loadFeed(reset){
+  if (reset){ feedOffset = 0; feedList.innerHTML = ""; }
+  feedMeta.innerHTML = `<span class="spinner"></span> ranking…`;
+  try {
+    const r = await fetch(`/api/feed?offset=${feedOffset}&limit=20`);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ("error " + r.status));
+    feedTotal = d.total;
+    feedList.insertAdjacentHTML("beforeend", d.items.map(feedCard).join(""));
+    feedOffset += d.items.length;
+    feedMeta.textContent = `${feedOffset} of ${feedTotal} connections · 👍/👎 tunes the ranking`;
+    feedMore.style.display = feedOffset < feedTotal ? "block" : "none";
+  } catch(e){ feedMeta.textContent = "feed failed: " + e.message; }
+}
+feedMore.addEventListener("click", () => loadFeed(false));
+feedList.addEventListener("click", async e => {
+  const note = e.target.closest(".fnote");
+  if (note){ setView("search"); qEl.value = decodeURIComponent(note.dataset.title); doSearch(); return; }
+  const up = e.target.closest(".vup"), dn = e.target.closest(".vdn");
+  if (!up && !dn) return;
+  const card = e.target.closest(".fcard"), id = decodeURIComponent(card.dataset.id);
+  const vote = up ? 1 : -1;
+  try {
+    const r = await fetch("/api/vote", { method:"POST", headers:{"Content-Type":"application/json"},
+                                         body: JSON.stringify({ id, vote }) });
+    if (!r.ok) throw new Error((await r.json()).error || r.status);
+    (up||dn).classList.add("sel");
+    card.querySelectorAll(".fvotes button").forEach(b => b.disabled = true);
+  } catch(err){ feedMeta.textContent = "vote failed: " + err.message; }
+});
+
 // ---------- topic map ----------
 const searchView = $("#searchView"), mapView = $("#mapView"),
       tabSearch = $("#tabSearch"), tabMap = $("#tabMap"),
@@ -334,7 +425,8 @@ async function loadClusters(k){
   try {
     const r = await fetch("/api/clusters?k=" + k); mapData = await r.json();
     hidden.clear();
-    mapMeta.textContent = `${mapData.notes.toLocaleString()} notes · ${mapData.clusters.length} topics`;
+    mapMeta.innerHTML = `${mapData.notes.toLocaleString()} notes · ${mapData.clusters.length} topics`
+      + (mapData.stale ? `<span class="pill">recomputing…</span>` : "");
     buildLegend(); resize();
   } catch(e){ mapMeta.textContent = "cluster failed: " + e.message; }
 }
@@ -480,7 +572,8 @@ async function loadBridges(){
   try {
     const r = await fetch("/api/bridges?limit=40"); const d = await r.json();
     if (!r.ok) throw new Error(d.error || ("error " + r.status));
-    bridgesMeta.textContent = `${d.bridges.length} of ${d.candidates} bridges · ${d.notes.toLocaleString()} notes · via-sim ≥ ${d.tHigh}, direct ≤ ${d.tLow} · ${d.ms} ms`;
+    bridgesMeta.innerHTML = `${d.bridges.length} of ${d.candidates} bridges · ${d.notes.toLocaleString()} notes · via-sim ≥ ${d.tHigh}, direct ≤ ${d.tLow} · ${d.ms} ms`
+      + (d.stale ? `<span class="pill">recomputing…</span>` : "");
     bridgesList.innerHTML = d.bridges.map(b => `
       <div class="bridge" title="sim a↔b ${b.sims.ab} · b↔c ${b.sims.bc} · a↔c ${b.sims.ac}">
         ${bpill(b.a)}
@@ -540,16 +633,19 @@ entNotes.addEventListener("click", e => {
 let entT; entQ.addEventListener("input", () => { clearTimeout(entT); entT = setTimeout(loadEntities, 200); });
 
 function setView(v){
+  tabFeed.classList.toggle("on", v==="feed");
   tabSearch.classList.toggle("on", v==="search");
   tabMap.classList.toggle("on", v==="map");
   tabSynth.classList.toggle("on", v==="synth");
   tabBridges.classList.toggle("on", v==="bridges");
   tabEnts.classList.toggle("on", v==="entities");
+  feedView.classList.toggle("on", v==="feed");
   searchView.style.display = v==="search" ? "flex" : "none";
   mapView.classList.toggle("on", v==="map");
   synthView.classList.toggle("on", v==="synth");
   bridgesView.classList.toggle("on", v==="bridges");
   entView.classList.toggle("on", v==="entities");
+  if (v==="feed") loadFeed(true);   // always re-rank: votes shift ordering on next load
   if (v==="map"){ if (!mapLoaded){ mapLoaded = true; loadClusters(+kSlider.value); } else resize(); }
   if (v==="bridges" && !bridgesLoaded){ bridgesLoaded = true; loadBridges(); }
   if (v==="entities" && !entsLoaded){ entsLoaded = true; loadEntities(); }
@@ -557,6 +653,7 @@ function setView(v){
   if (v==="synth") synthQ.focus();
   if (v==="entities") entQ.focus();
 }
+tabFeed.addEventListener("click", () => setView("feed"));
 tabSearch.addEventListener("click", () => setView("search"));
 tabMap.addEventListener("click", () => setView("map"));
 tabSynth.addEventListener("click", () => setView("synth"));
@@ -564,6 +661,7 @@ tabBridges.addEventListener("click", () => setView("bridges"));
 tabEnts.addEventListener("click", () => setView("entities"));
 
 refreshStatus();
+setView("feed");   // feed is the default view — re-ranks on every visit
 </script>
 </body>
 </html>

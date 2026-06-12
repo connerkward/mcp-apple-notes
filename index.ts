@@ -9,9 +9,13 @@ import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
 import http from "node:http";
-import { computeClusters } from "./clustering";
-import { computeBridges } from "./bridges";
+import { computeClusters, type ClusterResult } from "./clustering";
+import { mineBridges, selectBridges, selectWithHubPenalty, type MinedBridges } from "./bridges";
 import { synthesize } from "./synthesize";
+import {
+  buildFeedItems, rankAndArrange, loadVotes, sgdStep, replayVotes,
+  DEFAULT_WEIGHTS, type FeedItem, type Vote,
+} from "./feed";
 
 // Entity layer (optional, zero deps — bun:sqlite). A sibling benchmark harness
 // (exp-notes-indexing/layered_graph.py) writes ~/.mcp-apple-notes/layered_graph.db:
@@ -253,8 +257,31 @@ type IndexJob = {
 
 const indexJobs = new Map<string, IndexJob>();
 
-// Track the max modification_date at the time of last successful index
-let lastIndexedModDate: number | null = null;
+// LanceDB applies a DEFAULT LIMIT (10) to plain query() scans on tables opened
+// through createEmptyTable — an unlimited-looking scan silently returns 10 rows.
+// This was the index storm's root cause: the incremental indexer "saw" only 10
+// existing rows, judged the whole corpus new, and re-embedded everything on
+// every search. EVERY full scan must set an explicit limit.
+const FULL_SCAN_LIMIT = 200000;
+
+const DATA_DIR = path.join(os.homedir(), ".mcp-apple-notes");
+const INDEX_STATE_FILE = path.join(DATA_DIR, "index_state.json");
+
+// Track the max modification_date at the time of last successful index.
+// Persisted to disk so a fresh boot doesn't treat the whole corpus as changed.
+let lastIndexedModDate: number | null = (() => {
+  try {
+    return JSON.parse(require("node:fs").readFileSync(INDEX_STATE_FILE, "utf8")).lastIndexedModDate ?? null;
+  } catch { return null; }
+})();
+
+const markIndexed = () => {
+  lastIndexedModDate = getNotesMaxModDate();
+  try {
+    require("node:fs").mkdirSync(DATA_DIR, { recursive: true });
+    require("node:fs").writeFileSync(INDEX_STATE_FILE, JSON.stringify({ lastIndexedModDate }));
+  } catch { /* best-effort */ }
+};
 
 const getNotesMaxModDate = (): number | null => {
   try {
@@ -271,29 +298,186 @@ const getNotesMaxModDate = (): number | null => {
 const isActiveIndexJob = () =>
   [...indexJobs.values()].some((j) => j.status === "running" || j.status === "queued");
 
-// Call before search: if notes have changed, re-index synchronously before returning.
-// Incremental, so usually < 1s for a few changed notes.
-const syncReindexIfNeeded = async () => {
+// Call before search: if notes have changed, kick ONE background re-index and
+// return immediately. Search must NEVER block on bulk re-indexing — it serves
+// from the current index; results catch up once the background job finishes.
+// Single-flight: duplicate triggers (rapid concurrent searches) are dropped.
+let reindexInFlight = false;
+const kickReindexIfNeeded = () => {
   const maxMod = getNotesMaxModDate();
   if (maxMod === null) return;
   if (lastIndexedModDate !== null && maxMod <= lastIndexedModDate) return;
+  if (reindexInFlight || isActiveIndexJob()) return;
+  reindexInFlight = true;
+  void (async () => {
+    try {
+      const { notesTable } = await createNotesTable();
+      await indexNotes(notesTable);
+      markIndexed();
+    } catch (err) {
+      console.error("Background re-index failed:", err);
+    } finally {
+      reindexInFlight = false;
+    }
+  })();
+};
 
-  // If a job is already running (e.g. manual index-notes), wait for it to finish
-  if (isActiveIndexJob()) {
-    await new Promise<void>((resolve) => {
-      const iv = setInterval(() => {
-        if (!isActiveIndexJob()) { clearInterval(iv); resolve(); }
-      }, 200);
-    });
-    lastIndexedModDate = getNotesMaxModDate();
-    return;
+// ── precompute-once disk caches (bridges, clusters) ──────────────────────────
+// Keyed by a corpus fingerprint (note count + max modification date). Fresh →
+// serve from disk instantly. Stale → serve the stale copy instantly AND kick a
+// background recompute (single-flight per entry). Absent → compute inline once.
+const BRIDGES_CACHE_FILE = path.join(DATA_DIR, "bridges_cache.json");
+const CLUSTERS_CACHE_FILE = path.join(DATA_DIR, "clusters_cache.json");
+const VOTES_FILE = path.join(DATA_DIR, "votes.jsonl");
+const CONSOLIDATED_FILE = path.join(DATA_DIR, "consolidated.jsonl");
+
+const fsSync = require("node:fs") as typeof import("node:fs");
+
+const corpusFingerprint = (): string => {
+  try {
+    const db = new Database(NOTES_DB, { readonly: true });
+    try {
+      const row = db.query<{ n: number; m: number | null }, []>(
+        `SELECT COUNT(*) AS n, MAX(ZMODIFICATIONDATE1) AS m FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = ${noteEnt(db)} AND ZMARKEDFORDELETION = 0`
+      ).get();
+      return `${row?.n ?? 0}:${row?.m ?? 0}`;
+    } finally { db.close(); }
+  } catch { return "unknown"; }
+};
+
+type CacheFile = { fingerprint: string; computedAt: string; entries: Record<string, any> };
+const readCacheFile = (file: string): CacheFile | null => {
+  try { return JSON.parse(fsSync.readFileSync(file, "utf8")); } catch { return null; }
+};
+const writeCacheEntry = (file: string, fingerprint: string, subKey: string, result: any) => {
+  try {
+    const cur = readCacheFile(file);
+    const entries = cur && cur.fingerprint === fingerprint ? cur.entries : {};
+    entries[subKey] = result;
+    fsSync.mkdirSync(DATA_DIR, { recursive: true });
+    fsSync.writeFileSync(file, JSON.stringify({ fingerprint, computedAt: new Date().toISOString(), entries }));
+  } catch (e) { console.error(`cache write ${file} failed:`, e); }
+};
+
+const recomputing = new Set<string>(); // single-flight keys: `${file}#${subKey}`
+
+async function cachedCompute<T>(
+  file: string,
+  subKey: string,
+  compute: () => Promise<T>
+): Promise<{ result: T; stale: boolean; recomputing: boolean }> {
+  const fp = corpusFingerprint();
+  const flightKey = `${file}#${subKey}`;
+  const cached = readCacheFile(file);
+  const hasEntry = cached?.entries?.[subKey] !== undefined;
+
+  if (cached && hasEntry && cached.fingerprint === fp) {
+    return { result: cached.entries[subKey], stale: false, recomputing: recomputing.has(flightKey) };
+  }
+  if (cached && hasEntry) {
+    // Stale: serve instantly, recompute in background (drop duplicate triggers)
+    if (!recomputing.has(flightKey)) {
+      recomputing.add(flightKey);
+      void (async () => {
+        try {
+          const startFp = corpusFingerprint();
+          writeCacheEntry(file, startFp, subKey, await compute());
+        } catch (e) { console.error(`background recompute ${flightKey} failed:`, e); }
+        finally { recomputing.delete(flightKey); }
+      })();
+    }
+    return { result: cached.entries[subKey], stale: true, recomputing: true };
+  }
+  // First ever: compute inline, persist
+  const result = await compute();
+  writeCacheEntry(file, fp, subKey, result);
+  return { result, stale: false, recomputing: false };
+}
+
+const getMinedBridges = () => cachedCompute<MinedBridges>(BRIDGES_CACHE_FILE, "mined", async () => {
+  const { notesTable } = await createNotesTable();
+  const extractor = await getExtractor();
+  const embedBatch = async (arr: string[]) => (await extractor(arr, { pooling: "mean", normalize: true })).tolist() as number[][];
+  return await mineBridges(notesTable, embedBatch);
+});
+
+const getClusters = (k: number) => cachedCompute<ClusterResult>(CLUSTERS_CACHE_FILE, `k${k}`, async () => {
+  const { notesTable } = await createNotesTable();
+  return await computeClusters(notesTable, k);
+});
+
+// ── the FEED: ranked evidence-first stream + online logistic ranker ──────────
+const feedWeights: number[] = [...DEFAULT_WEIGHTS];
+const votedMap = new Map<string, 1 | -1>(); // itemId → last vote
+{ // votes persist and re-apply on boot
+  const votes = loadVotes(VOTES_FILE);
+  for (const v of votes) votedMap.set(v.id, v.vote);
+  replayVotes(feedWeights, votes);
+}
+
+let feedItemsCache: { fp: string; items: FeedItem[] } | null = null;
+
+async function getFeedItems(): Promise<FeedItem[]> {
+  const fp = corpusFingerprint();
+  if (feedItemsCache?.fp === fp) return feedItemsCache.items;
+
+  // Bridges come from the disk cache; if never mined, don't block the feed for
+  // ~2 min — serve abstraction pairs + entity overlaps now, kick the mine, and
+  // bridges appear on a later load.
+  let bridgePool: MinedBridges | null = null;
+  const cached = readCacheFile(BRIDGES_CACHE_FILE);
+  if (cached?.entries?.mined !== undefined) {
+    bridgePool = cached.entries.mined;
+    if (cached.fingerprint !== fp) void getMinedBridges(); // background refresh
+  } else {
+    void getMinedBridges(); // first-ever mine in background
   }
 
-  // Run inline incremental re-index — blocks until done
-  const { notesTable } = await createNotesTable();
-  await indexNotes(notesTable);
-  lastIndexedModDate = getNotesMaxModDate();
-};
+  // title → text map for bridge evidence (one table scan)
+  const noteText = new Map<string, string>();
+  if (bridgePool) {
+    try {
+      const { notesTable } = await createNotesTable();
+      const rows: any[] = await notesTable.query().select(["title", "content"]).limit(200000).toArray();
+      for (const r of rows) {
+        const cur = noteText.get(r.title) ?? "";
+        if (cur.length < 4000) noteText.set(r.title, cur + " " + (r.content ?? ""));
+      }
+    } catch { /* feed degrades to no bridge evidence */ }
+  }
+
+  const items = buildFeedItems({
+    bridges: bridgePool ? selectWithHubPenalty(bridgePool.all, 60) : [],
+    noteText,
+    consolidatedPath: CONSOLIDATED_FILE,
+    layeredDbPath: LAYERED_DB,
+  });
+  feedItemsCache = { fp, items };
+  return items;
+}
+
+async function serveFeed(offset: number, limit: number) {
+  const items = await getFeedItems();
+  const arranged = rankAndArrange(items, feedWeights);
+  const page = arranged.slice(offset, offset + limit).map(it => ({
+    ...it,
+    voted: votedMap.get(it.id),
+  }));
+  return { items: page, total: arranged.length, offset, limit };
+}
+
+function recordVote(id: string, vote: 1 | -1): { ok: true } | { error: string } {
+  const item = feedItemsCache?.items.find(it => it.id === id);
+  if (!item) return { error: `unknown feed item id: ${id}` };
+  const v: Vote = { ts: new Date().toISOString(), id, kind: item.kind, vote, features: item.features };
+  try {
+    fsSync.mkdirSync(DATA_DIR, { recursive: true });
+    fsSync.appendFileSync(VOTES_FILE, JSON.stringify(v) + "\n");
+  } catch (e) { return { error: String(e) }; }
+  sgdStep(feedWeights, item.features, vote > 0 ? 1 : 0);
+  votedMap.set(id, vote);
+  return { ok: true };
+}
 
 const INDEXER_RESOURCE_URI = "ui://apple-notes/indexer.html";
 
@@ -588,25 +772,46 @@ export const indexNotes = async (
   if (job) appendJobLog(job, "Fetching notes from Apple Notes…");
   const allNotes = await getAllNoteDetails();
 
-  // 2. Query existing index to find what's already embedded
-  const existingMap = new Map<string, string>(); // title → modification_date
+  // 2. Query existing index to find what's already embedded.
+  // Titles are NOT unique in Apple Notes ("TODO" ×10, "New Note" ×16, …), so a
+  // title → single-mod-date map can never converge: for a duplicated title at
+  // least one of the notes always compares unequal, which re-embedded the same
+  // ~90 notes on EVERY change check, forever (the index storm). Compare the
+  // per-title SET of modification dates instead — a title is dirty iff the set
+  // in the index differs from the set in Apple Notes.
+  const existingDates = new Map<string, Set<string>>(); // title → set of modification_dates
   try {
-    const rows = await notesTable.query().select(["title", "modification_date"]).toArray();
-    for (const row of rows) existingMap.set(row.title, row.modification_date);
+    const rows = await notesTable.query().select(["title", "modification_date"]).limit(FULL_SCAN_LIMIT).toArray();
+    for (const row of rows) {
+      let s = existingDates.get(row.title);
+      if (!s) existingDates.set(row.title, (s = new Set()));
+      s.add(row.modification_date);
+    }
   } catch { /* empty table */ }
 
+  const appleByTitle = new Map<string, typeof allNotes>();
+  for (const n of allNotes) {
+    if (!n.title) continue;
+    const arr = appleByTitle.get(n.title);
+    if (arr) arr.push(n); else appleByTitle.set(n.title, [n]);
+  }
+
   // 3. Remove notes deleted from Apple Notes
-  const allTitles = new Set(allNotes.map((n) => n.title));
-  const deletedTitles = [...existingMap.keys()].filter((t) => !allTitles.has(t));
+  const deletedTitles = [...existingDates.keys()].filter((t) => !appleByTitle.has(t));
   for (const title of deletedTitles) {
     await notesTable.delete(`title = '${escapeForFilter(title)}'`);
   }
 
-  // 4. Filter to only new or modified notes
-  const toIndex = allNotes.filter((n) => {
-    if (!n.title) return false;
-    return existingMap.get(n.title) !== n.modification_date;
-  });
+  // 4. Find dirty titles (new, modified, or duplicate-set changed)
+  const setsEqual = (a: Set<string>, b: Set<string>) =>
+    a.size === b.size && [...a].every((x) => b.has(x));
+  const dirtyTitles: string[] = [];
+  for (const [title, notes] of appleByTitle) {
+    const want = new Set(notes.map((n) => n.modification_date));
+    const have = existingDates.get(title);
+    if (!have || !setsEqual(want, have)) dirtyTitles.push(title);
+  }
+  const toIndex = dirtyTitles.flatMap((t) => appleByTitle.get(t)!);
   const skipped = allNotes.length - toIndex.length;
 
   const summary = [
@@ -623,10 +828,11 @@ export const indexNotes = async (
     return { chunks: 0, report: "", allNotes: allNotes.length, time: performance.now() - start };
   }
 
-  // 5. Delete stale versions of modified notes before re-embedding
-  for (const note of toIndex) {
-    if (existingMap.has(note.title)) {
-      await notesTable.delete(`title = '${escapeForFilter(note.title)}'`);
+  // 5. Delete stale versions of dirty titles before re-embedding (once per
+  // title — duplicated titles share rows, so all their notes are re-added below)
+  for (const title of dirtyTitles) {
+    if (existingDates.has(title)) {
+      await notesTable.delete(`title = '${escapeForFilter(title)}'`);
     }
   }
 
@@ -638,7 +844,9 @@ export const indexNotes = async (
   // 6. Build chunks: convert HTML → Markdown, then split large notes
   const CHUNK_SIZE = 1500; // chars (~300 tokens)
   const CHUNK_OVERLAP = 150;
-  const chunks: Array<{ id: string; title: string; content: string; creation_date: string; modification_date: string; folder: string }> = [];
+  // NOTE: chunk objects must match the Lance schema exactly (no extra `id`
+  // field — the table was created without one, and add() rejects extras).
+  const chunks: Array<{ title: string; content: string; creation_date: string; modification_date: string; folder: string }> = [];
 
   let td: ((html: string) => string) | null = null;
   try { td = await getTurndown(); } catch { /* ignore */ }
@@ -658,9 +866,8 @@ export const indexNotes = async (
       ? await splitter.splitText(text)
       : [text];
 
-    splits.forEach((chunk, ci) => {
+    splits.forEach((chunk) => {
       chunks.push({
-        id: `${note.title}::${ci}`,
         title: note.title,
         content: chunk,
         creation_date: note.creation_date,
@@ -710,7 +917,10 @@ export const indexNotes = async (
 
 const purgeDb = async () => {
   dbPromise = null;
-  await fs.rm(path.join(os.homedir(), ".mcp-apple-notes"), { recursive: true, force: true });
+  // Only the Lance index + its watermark — NOT the whole ~/.mcp-apple-notes dir,
+  // which also holds votes.jsonl, consolidated.jsonl, layered_graph.db, caches.
+  await fs.rm(path.join(DATA_DIR, "data"), { recursive: true, force: true });
+  await fs.rm(INDEX_STATE_FILE, { force: true });
 };
 
 const createNotesTableInner = async (overrideName?: string) => {
@@ -721,6 +931,11 @@ const createNotesTableInner = async (overrideName?: string) => {
     notesTableSchema,
     { mode: "create", existOk: true }
   );
+  // The cached connection pins tables to the version it knew at open — without
+  // this, a long-lived process reads STALE data after its own writes (verified:
+  // a second indexNotes pass in one process re-embedded the entire corpus and
+  // duplicated every row, because it couldn't see the first pass's commits).
+  if (typeof notesTable.checkoutLatest === "function") await notesTable.checkoutLatest();
   const indices = await notesTable.listIndices();
   const lancedb = await import("@lancedb/lancedb");
   if (!indices.find((index: any) => index.name === "content_idx")) {
@@ -782,7 +997,7 @@ const startIndexJob = async (notesTable: any) => {
   void (async () => {
     try {
       const result = await indexNotes(notesTable, undefined, job);
-      lastIndexedModDate = getNotesMaxModDate();
+      markIndexed();
       updateJob(job, {
         status: "completed",
         finishedAt: Date.now(),
@@ -836,7 +1051,7 @@ const startIndexJobLazy = async (tableName?: string) => {
       const { notesTable } = await createNotesTable(tableName);
       appendJobLog(job, "Database ready.");
       const result = await indexNotes(notesTable, undefined, job);
-      lastIndexedModDate = getNotesMaxModDate();
+      markIndexed();
       updateJob(job, {
         status: "completed",
         finishedAt: Date.now(),
@@ -915,7 +1130,7 @@ server.tool("get-note", GetNoteSchema.shape, async ({ title }) => {
   if (note && note.title) return createTextResponse(JSON.stringify(note));
 
   // Fuzzy fallback via search index
-  await syncReindexIfNeeded();
+  kickReindexIfNeeded();
   const { notesTable } = await createNotesTable();
   const results = await searchAndCombineResults(notesTable, title, 1);
   if (!results.length) return createTextResponse(JSON.stringify({ error: `No note found matching "${title}"` }));
@@ -957,7 +1172,7 @@ server.tool("list-folders", {}, async () => {
 
 server.tool("list-tags", {}, async () => {
   const { notesTable } = await createNotesTable();
-  const rows = await notesTable.query().select(["title", "content"]).toArray();
+  const rows = await notesTable.query().select(["title", "content"]).limit(FULL_SCAN_LIMIT).toArray();
   const tagCounts = new Map<string, number>();
   const seen = new Set<string>();
   for (const row of rows) {
@@ -976,7 +1191,7 @@ server.tool("list-tags", {}, async () => {
 server.tool("search-by-tag", { tag: z.string().describe("Hashtag to search for, with or without leading #") }, async ({ tag }) => {
   const { notesTable } = await createNotesTable();
   const normalized = tag.replace(/^#/, "").toLowerCase();
-  const rows = await notesTable.query().select(["title", "folder", "modification_date", "content"]).toArray();
+  const rows = await notesTable.query().select(["title", "folder", "modification_date", "content"]).limit(FULL_SCAN_LIMIT).toArray();
   const seen = new Set<string>();
   const results: any[] = [];
   for (const row of rows) {
@@ -993,7 +1208,7 @@ server.tool("related-notes", {
   title: z.string().describe("Exact title of the source note"),
   limit: z.number().int().min(1).max(20).optional().describe("Max results (default 10)"),
 }, async ({ title, limit = 10 }) => {
-  await syncReindexIfNeeded();
+  kickReindexIfNeeded();
   const note = await getNoteDetailsByTitle(title);
   if (!note?.title) return createTextResponse(JSON.stringify({ error: `Note not found: "${title}"` }));
 
@@ -1004,7 +1219,7 @@ server.tool("related-notes", {
   // Vector similarity over title + first 500 chars
   const [vectorResults, allRows] = await Promise.all([
     notesTable.search(`${note.title} ${(note.content ?? "").slice(0, 500)}`, "vector").limit(50).toArray(),
-    notesTable.query().select(["title", "folder", "modification_date", "content"]).toArray(),
+    notesTable.query().select(["title", "folder", "modification_date", "content"]).limit(FULL_SCAN_LIMIT).toArray(),
   ]);
 
   const scores = new Map<string, number>();
@@ -1042,10 +1257,14 @@ server.tool("bridge-notes", {
   limit: z.number().int().min(1).max(200).optional().describe("Max bridges (default 20)"),
   folder: z.string().optional().describe("Only bridges where A or C is in this folder (exact path segment match)"),
 }, async ({ limit = 20, folder }) => {
-  const { notesTable } = await createNotesTable();
-  const extractor = await getExtractor();
-  const embedBatch = async (arr: string[]) => (await extractor(arr, { pooling: "mean", normalize: true })).tolist() as number[][];
-  const result = await computeBridges({ table: notesTable, embedBatch, limit, folder });
+  const { result: mined, stale } = await getMinedBridges();
+  return createTextResponse(JSON.stringify({ ...selectBridges(mined, { limit, folder }), stale }));
+});
+
+server.tool("feed", {
+  limit: z.number().int().min(1).max(100).optional().describe("Max feed items (default 20)"),
+}, async ({ limit = 20 }) => {
+  const result = await serveFeed(0, limit);
   return createTextResponse(JSON.stringify(result));
 });
 
@@ -1097,14 +1316,14 @@ server.tool("check-changes", {}, async () => {
 });
 
 server.tool("search-notes", QueryNotesSchema.shape, async ({ query, folder, modifiedAfter, modifiedBefore }) => {
-  await syncReindexIfNeeded();
+  kickReindexIfNeeded();
   const { notesTable } = await createNotesTable();
   const combinedResults = await searchAndCombineResults(notesTable, query, 20, folder, modifiedAfter, modifiedBefore);
   return createTextResponse(JSON.stringify(combinedResults));
 });
 
 server.tool("find-notes", QueryNotesSchema.shape, async ({ query, folder, modifiedAfter, modifiedBefore }) => {
-  await syncReindexIfNeeded();
+  kickReindexIfNeeded();
   const { notesTable } = await createNotesTable();
 
   const queryL = query.toLowerCase();
@@ -1128,6 +1347,7 @@ server.tool("find-notes", QueryNotesSchema.shape, async ({ query, folder, modifi
   const rows = await notesTable.query()
     .where(conditions)
     .select(["title", "content", "folder", "modification_date"])
+    .limit(FULL_SCAN_LIMIT)
     .toArray()
     .catch(() => [] as any[]);
 
@@ -1182,6 +1402,7 @@ server.tool("index-health", {}, async () => {
 server.tool("index-notes-blocking", {}, async (_args, extra) => {
   const { notesTable } = await createNotesTable();
   const { time, chunks } = await indexNotes(notesTable, extra);
+  markIndexed();
   return createTextResponse(
     `Indexed ${chunks} notes chunks in ${time}ms. You can now search for them using the "search-notes" tool.`
   );
@@ -1305,7 +1526,7 @@ if (process.argv.includes("--stdio")) {
       const k = Math.min(parseInt(u.searchParams.get("k") ?? "25") || 25, 100);
       const folder = u.searchParams.get("folder") ?? undefined;
       try {
-        await syncReindexIfNeeded();
+        kickReindexIfNeeded();
         const { notesTable } = await createNotesTable();
         const t0 = performance.now();
         const results = await searchAndCombineResults(notesTable, q, k, folder);
@@ -1360,9 +1581,8 @@ if (process.argv.includes("--stdio")) {
     if (req.method === "GET" && u.pathname === "/api/clusters") {
       const k = Math.min(Math.max(parseInt(u.searchParams.get("k") ?? "12") || 12, 2), 40);
       try {
-        const { notesTable } = await createNotesTable();
-        const result = await computeClusters(notesTable, k);
-        sendJson(200, result);
+        const { result, stale, recomputing: rec } = await getClusters(k);
+        sendJson(200, { ...result, stale, recomputing: rec });
       } catch (e: any) {
         sendJson(500, { error: String(e?.message ?? e) });
       }
@@ -1373,13 +1593,42 @@ if (process.argv.includes("--stdio")) {
       const limit = Math.min(Math.max(parseInt(u.searchParams.get("limit") ?? "40") || 40, 1), 200);
       const folder = u.searchParams.get("folder") ?? undefined;
       try {
-        const { notesTable } = await createNotesTable();
-        const extractor = await getExtractor();
-        const embedBatch = async (arr: string[]) => (await extractor(arr, { pooling: "mean", normalize: true })).tolist() as number[][];
-        sendJson(200, await computeBridges({ table: notesTable, embedBatch, limit, folder }));
+        const { result: mined, stale, recomputing: rec } = await getMinedBridges();
+        sendJson(200, { ...selectBridges(mined, { limit, folder }), stale, recomputing: rec });
       } catch (e: any) {
         sendJson(500, { error: String(e?.message ?? e) });
       }
+      return;
+    }
+
+    if (req.method === "GET" && u.pathname === "/api/feed") {
+      const limit = Math.min(Math.max(parseInt(u.searchParams.get("limit") ?? "20") || 20, 1), 100);
+      const offset = Math.max(parseInt(u.searchParams.get("offset") ?? "0") || 0, 0);
+      try {
+        sendJson(200, await serveFeed(offset, limit));
+      } catch (e: any) {
+        sendJson(500, { error: String(e?.message ?? e) });
+      }
+      return;
+    }
+
+    if (req.method === "POST" && u.pathname === "/api/vote") {
+      const chunks: Buffer[] = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", async () => {
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+          const id = String(body.id ?? "");
+          const vote = body.vote === 1 || body.vote === -1 ? body.vote : null;
+          if (!id || vote === null) { sendJson(400, { error: "expected {id, vote: 1|-1}" }); return; }
+          await getFeedItems(); // make sure items (and their features) are loaded
+          const r = recordVote(id, vote);
+          if ("error" in r) { sendJson(404, r); return; }
+          sendJson(200, { ok: true, weights: feedWeights.map(w => Math.round(w * 10000) / 10000) });
+        } catch (e: any) {
+          sendJson(500, { error: String(e?.message ?? e) });
+        }
+      });
       return;
     }
 
@@ -1490,7 +1739,7 @@ export const searchAndCombineResults = async (
     notesTable.search(query, "vector").limit(candidateLimit).toArray(),
     notesTable.search(query, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]),
     notesTable.search(query, "fts", "title").limit(candidateLimit).toArray().catch(() => [] as any[]),
-    notesTable.query().where(substringConditions).select(["title", "content", "folder", "modification_date"]).toArray().catch(() => [] as any[]),
+    notesTable.query().where(substringConditions).select(["title", "content", "folder", "modification_date"]).limit(FULL_SCAN_LIMIT).toArray().catch(() => [] as any[]),
     notesTable.search(fuzzyQuery, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]),
     phraseQuery ? notesTable.search(phraseQuery, "fts", "content").limit(candidateLimit).toArray().catch(() => [] as any[]) : Promise.resolve([] as any[]),
   ]);
