@@ -1,7 +1,7 @@
 {
   "manifest_version": "0.3",
   "name": "mcp-apple-notes",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "An MCP server for semantic search and connection-discovery across your own Apple Notes — hybrid search, Swanson-ABC bridges, entity threads, and cited synthesis over everything you've written.",
   "author": {
     "name": "Conner K Ward",

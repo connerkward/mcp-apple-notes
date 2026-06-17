@@ -76,17 +76,11 @@ const listEntities = (query?: string, limit = 30) => withLayeredDb((db) => {
 //   SYNTH_BASE_URL   default https://api.openai.com/v1
 //                    LM Studio: http://localhost:1234/v1 · Ollama: http://localhost:11434/v1
 //   SYNTH_MODEL      default gpt-4o-mini
-//   OPENAI_API_KEY   from env or ~/dev/central/.env (any non-empty string for local servers)
+//   OPENAI_API_KEY   from env (any non-empty string for local servers)
 let _llm: { key: string; baseURL: string; model: string } | null | undefined;
 const getLlmConfig = () => {
   if (_llm !== undefined) return _llm;
-  let key = process.env.OPENAI_API_KEY?.trim() || "";
-  if (!key) {
-    try {
-      const env = require("node:fs").readFileSync(path.join(os.homedir(), "dev", "central", ".env"), "utf8");
-      key = env.match(/^OPENAI_API_KEY=(.+)$/m)?.[1]?.trim() || "";
-    } catch {}
-  }
+  const key = process.env.OPENAI_API_KEY?.trim() || "";
   _llm = key ? {
     key,
     baseURL: process.env.SYNTH_BASE_URL?.trim() || "https://api.openai.com/v1",
@@ -1142,7 +1136,7 @@ server.tool("update-note", UpdateNoteSchema.shape, async ({ title, content }) =>
   const script = `
     const app = Application('Notes');
     const matches = app.notes.whose({name: ${JSON.stringify(title)}});
-    if (matches.length === 0) throw new Error('Note not found: ${title.replace(/'/g, "\\'")}');
+    if (matches.length === 0) throw new Error(${JSON.stringify("Note not found: " + title)});
     matches[0].body = ${JSON.stringify(content)};
   `;
   try {
@@ -1483,7 +1477,12 @@ if (process.argv.includes("--stdio")) {
   void getExtractor().then(() => console.error("Model pre-warm complete")).catch(() => {});
 } else {
   const httpServer = http.createServer(async (req, res) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    // Same-machine only: reflect a localhost origin, never wildcard (the server binds 127.0.0.1
+    // and has no auth, so a wildcard would let any website read your notes via the browser).
+    const origin = req.headers.origin;
+    if (origin && /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+    }
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version");
     res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
@@ -1564,7 +1563,7 @@ if (process.argv.includes("--stdio")) {
       const q = (u.searchParams.get("q") ?? "").trim();
       if (!q) { sendJson(400, { error: "missing q" }); return; }
       const llm = getLlmConfig();
-      if (!llm) { sendJson(503, { error: "synthesis unavailable: no OPENAI_API_KEY (set it in env or ~/dev/central/.env)" }); return; }
+      if (!llm) { sendJson(503, { error: "synthesis unavailable: set OPENAI_API_KEY (and optionally SYNTH_BASE_URL / SYNTH_MODEL)" }); return; }
       try {
         const { notesTable } = await createNotesTable();
         const extractor = await getExtractor();
@@ -1670,10 +1669,11 @@ if (process.argv.includes("--stdio")) {
 
     res.writeHead(404); res.end();
   });
-  httpServer.listen(PORT, () => {
-    console.error(`Apple Notes search UI:  http://localhost:${PORT}/`);
-    console.error(`MCP endpoint:           http://localhost:${PORT}/mcp`);
-    console.error(`Expose with: npx cloudflared tunnel --url http://localhost:${PORT}`);
+  // Bind loopback only — the HTTP UI and /mcp endpoint are unauthenticated and can read AND
+  // write Apple Notes (via osascript), so they must never be exposed to the LAN or a tunnel.
+  httpServer.listen(PORT, "127.0.0.1", () => {
+    console.error(`Apple Notes search UI:  http://127.0.0.1:${PORT}/`);
+    console.error(`MCP endpoint:           http://127.0.0.1:${PORT}/mcp`);
   });
 }
 
