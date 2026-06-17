@@ -186,3 +186,7 @@ tail -n 50 -f ~/Library/Logs/Claude/mcp-server-apple-notes.log
 ```
 
 Permissions error → ensure **bun** (`~/.bun/bin/bun`) has Full Disk Access in System Settings → Privacy & Security.
+
+---
+
+🧭 **[ckw-skills](https://github.com/connerkward/ckw-skills)** — part of Conner K. Ward's collection of Claude Code skills & MCP servers.
