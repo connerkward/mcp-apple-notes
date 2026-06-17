@@ -11,7 +11,7 @@ It traverses your accumulated mass of notes: semantic + BM25 hybrid search, non-
 ### Install as a Claude Code plugin
 
 ```
-/plugin marketplace add connerkward/ckw-tools
+/plugin marketplace add connerkward/ckw-skills
 /plugin install apple-notes@connerkward
 ```
 

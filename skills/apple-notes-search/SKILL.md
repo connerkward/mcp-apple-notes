@@ -44,7 +44,7 @@ Disk Access. Steps, in order:
          "command": "/Users/<you>/.bun/bin/bun",
          "args": ["/Users/<you>/mcp-apple-notes/index.ts", "--stdio"] } } }
      ```
-   - As a Claude Code plugin (bundles this skill too): `/plugin marketplace add connerkward/ckw-tools` then `/plugin install apple-notes@connerkward`.
+   - As a Claude Code plugin (bundles this skill too): `/plugin marketplace add connerkward/ckw-skills` then `/plugin install apple-notes@connerkward`.
 5. **Restart the client**, then tell the user to ask **"Index my Apple Notes"** (or call
    `index-notes`). First index of ~1,800 notes takes a few seconds.
 
