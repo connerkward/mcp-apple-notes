@@ -60,10 +60,6 @@
   "compatibility": {
     "platforms": [
       "darwin"
-    ],
-    "runtimes": {
-      "bun": ">=1.0.0"
-    }
-  },
-  "_setup_note": "macOS only. Requires the bun runtime on PATH and Full Disk Access granted manually to the host app (System Settings → Privacy & Security → Full Disk Access) so the server can read the local Apple Notes NoteStore.sqlite."
+    ]
+  }
 }
