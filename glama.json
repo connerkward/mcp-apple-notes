@@ -1,0 +1,13 @@
+{
+  "$schema": "https://glama.ai/schemas/glama.json",
+  "maintainers": ["connerkward"],
+  "title": "Apple Notes",
+  "description": "Semantic search and connection-discovery across your own Apple Notes — hybrid search, Swanson-ABC bridges, entity threads, cited synthesis. Direct SQLite+protobuf; on-device embeddings; macOS; local stdio MCP server.",
+  "tags": ["apple-notes", "macos", "semantic-search", "hybrid-search", "knowledge-graph", "embeddings", "on-device", "note-taking", "sqlite", "protobuf", "stdio", "local-first", "claude-code"],
+  "repository": "https://github.com/connerkward/mcp-apple-notes",
+  "homepage": "https://github.com/connerkward/mcp-apple-notes",
+  "license": "MIT",
+  "categories": ["knowledge-memory", "productivity"],
+  "language": "TypeScript",
+  "runtime": "node"
+}
