@@ -1,0 +1,42 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.connerkward/mcp-apple-notes",
+  "description": "An MCP server for semantic search and connection-discovery across your own Apple Notes — hybrid search, Swanson-ABC bridges, entity threads, and cited synthesis over everything you've written.",
+  "title": "Apple Notes",
+  "websiteUrl": "https://github.com/connerkward/mcp-apple-notes",
+  "repository": {
+    "url": "https://github.com/connerkward/mcp-apple-notes",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/connerkward/mcp-apple-notes/releases/download/v1.0.0/mcp-apple-notes.mcpb",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "OPENAI_API_KEY",
+          "description": "Only required for synthesis. Set to 'local' when pointing SYNTH_BASE_URL at a local OpenAI-compatible server (LM Studio / Ollama); set to a funded key for real OpenAI. Search, bridges, entities run on-device with no key.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SYNTH_BASE_URL",
+          "description": "Optional OpenAI-compatible base URL for synthesis (e.g. http://localhost:1234/v1 for LM Studio). Keeps notes on-device.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SYNTH_MODEL",
+          "description": "Optional model id for synthesis when SYNTH_BASE_URL is set (defaults to gpt-4o-mini for real OpenAI).",
+          "isRequired": false,
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,69 @@
+{
+  "manifest_version": "0.3",
+  "name": "mcp-apple-notes",
+  "version": "1.0.0",
+  "description": "An MCP server for semantic search and connection-discovery across your own Apple Notes — hybrid search, Swanson-ABC bridges, entity threads, and cited synthesis over everything you've written.",
+  "author": {
+    "name": "Conner K Ward",
+    "url": "https://github.com/connerkward"
+  },
+  "homepage": "https://github.com/connerkward/mcp-apple-notes",
+  "documentation": "https://github.com/connerkward/mcp-apple-notes#readme",
+  "license": "MIT",
+  "keywords": [
+    "apple-notes",
+    "mcp",
+    "model-context-protocol",
+    "semantic-search",
+    "notes",
+    "knowledge-graph"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "index.ts",
+    "mcp_config": {
+      "command": "bun",
+      "args": [
+        "${__dirname}/index.ts",
+        "--stdio"
+      ],
+      "env": {
+        "OPENAI_API_KEY": "${user_config.OPENAI_API_KEY}",
+        "SYNTH_BASE_URL": "${user_config.SYNTH_BASE_URL}",
+        "SYNTH_MODEL": "${user_config.SYNTH_MODEL}"
+      }
+    }
+  },
+  "user_config": {
+    "OPENAI_API_KEY": {
+      "type": "string",
+      "title": "OpenAI API Key",
+      "description": "Only required for synthesis. Set to 'local' when pointing SYNTH_BASE_URL at a local OpenAI-compatible server (LM Studio / Ollama); set to a funded key for real OpenAI. Search, bridges, and entities run on-device with no key.",
+      "sensitive": true,
+      "required": false
+    },
+    "SYNTH_BASE_URL": {
+      "type": "string",
+      "title": "Synthesis Base URL",
+      "description": "Optional OpenAI-compatible base URL for synthesis (e.g. http://localhost:1234/v1 for LM Studio). Keeps notes on-device.",
+      "sensitive": false,
+      "required": false
+    },
+    "SYNTH_MODEL": {
+      "type": "string",
+      "title": "Synthesis Model",
+      "description": "Optional model id for synthesis when SYNTH_BASE_URL is set (defaults to gpt-4o-mini for real OpenAI).",
+      "sensitive": false,
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ],
+    "runtimes": {
+      "bun": ">=1.0.0"
+    }
+  },
+  "_setup_note": "macOS only. Requires the bun runtime on PATH and Full Disk Access granted manually to the host app (System Settings → Privacy & Security → Full Disk Access) so the server can read the local Apple Notes NoteStore.sqlite."
+}

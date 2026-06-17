@@ -1,0 +1,25 @@
+# mcp-apple-notes
+
+> mcp-apple-notes is an MCP server for semantic search and connection-discovery across your own Apple Notes — hybrid search, Swanson-ABC bridges, entity threads, and cited synthesis over everything you've written.
+
+It traverses your accumulated mass of Apple Notes: semantic + BM25 hybrid search,
+Swanson-ABC bridge discovery (non-obvious A↔C connections via a shared intermediary B),
+entity threads, related-notes, and cited synthesis. Embeddings, search, BM25, clustering,
+and bridges run on-device; only synthesis generation calls an LLM (local via LM
+Studio/Ollama, or cloud via OpenAI — the user's choice). It reads the Apple Notes SQLite
+store directly and decodes protobuf for real note text, indexing ~1,800 notes in seconds
+(JXA-based servers take ~49 minutes and fail on macOS Sequoia).
+
+## Install
+
+- MCP server (bun): https://github.com/connerkward/mcp-apple-notes#installation
+  Requires macOS, bun, and Full Disk Access for `~/.bun/bin/bun`. Register with
+  `claude mcp add apple-notes -- bun /path/to/index.ts --stdio`, then "Index my Apple Notes".
+- Claude Code plugin: `/plugin marketplace add connerkward/ckw-tools` then `/plugin install apple-notes@connerkward`
+- Agent skill: `skills/apple-notes-search/SKILL.md`
+
+## Links
+
+- Repository: https://github.com/connerkward/mcp-apple-notes
+- README: https://github.com/connerkward/mcp-apple-notes#readme
+- Upstream fork base: https://github.com/RafalWilinski/mcp-apple-notes

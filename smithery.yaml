@@ -1,0 +1,36 @@
+# Smithery configuration for mcp-apple-notes
+# https://smithery.ai/docs
+#
+# NOTE: This is a LOCAL stdio server that requires macOS Full Disk Access to read
+# the on-device Apple Notes SQLite store. It is NOT a hostable/remote server, so
+# Smithery's hosted-deployment path does not apply. This config describes the
+# local stdio command so Smithery can list/install it as a local server.
+
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      openaiApiKey:
+        type: string
+        title: OPENAI_API_KEY
+        description: Only needed for synthesis. Use 'local' with a local LLM, or a funded key for OpenAI. Search/bridges/entities run on-device with no key.
+      synthBaseUrl:
+        type: string
+        title: SYNTH_BASE_URL
+        description: Optional OpenAI-compatible base URL for synthesis (e.g. http://localhost:1234/v1 for LM Studio / Ollama).
+      synthModel:
+        type: string
+        title: SYNTH_MODEL
+        description: Optional synthesis model id (defaults to gpt-4o-mini for real OpenAI).
+    required: []
+  commandFunction: |
+    (config) => ({
+      command: "bun",
+      args: ["index.ts", "--stdio"],
+      env: {
+        ...(config.openaiApiKey ? { OPENAI_API_KEY: config.openaiApiKey } : {}),
+        ...(config.synthBaseUrl ? { SYNTH_BASE_URL: config.synthBaseUrl } : {}),
+        ...(config.synthModel ? { SYNTH_MODEL: config.synthModel } : {})
+      }
+    })

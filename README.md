@@ -2,7 +2,20 @@
 
 ![MCP Apple Notes](./images/logo.png)
 
-A [Model Context Protocol (MCP)](https://www.anthropic.com/news/model-context-protocol) server for fast, accurate, always-fresh semantic search over your Apple Notes — fully local, no API keys.
+**mcp-apple-notes is an MCP server for semantic search and connection-discovery across your own Apple Notes — hybrid search, Swanson-ABC bridges, entity threads, and cited synthesis over everything you've written.**
+
+It traverses your accumulated mass of notes: semantic + BM25 hybrid search, non-obvious bridge connections, entity threads, related-notes, and grounded synthesis across everything you've ever written in Apple Notes. Embeddings, search, BM25, clustering, and bridges run **on-device**; only **synthesis generation** calls an LLM (local via LM Studio/Ollama, or cloud via OpenAI — your choice). Built on the [Model Context Protocol (MCP)](https://www.anthropic.com/news/model-context-protocol).
+
+> Forked from [RafalWilinski/mcp-apple-notes](https://github.com/RafalWilinski/mcp-apple-notes) — this fork reads the SQLite store + protobuf directly and adds bridges, entities, feed, and synthesis.
+
+### Install as a Claude Code plugin
+
+```
+/plugin marketplace add connerkward/ckw-tools
+/plugin install apple-notes@connerkward
+```
+
+This registers the MCP server and bundles the `apple-notes-search` agent skill. Or install the MCP server manually — see [Installation](#installation) below (requires macOS + bun + Full Disk Access).
 
 > **Other MCP Notes servers break at scale.** They use JXA (AppleScript automation) to read notes one-by-one — fine for 50 notes, unusable at 500+. At 1,800 notes, JXA takes ~49 minutes just to fetch content. On macOS Sequoia it's worse: Apple silently denies Automation permission to processes without a bundle ID, so JXA-based servers fail entirely. This fork reads the SQLite database directly, decodes the protobuf blobs for real note text, and indexes 1,800 notes in under 5 seconds.
 
@@ -38,7 +51,7 @@ A [Model Context Protocol (MCP)](https://www.anthropic.com/news/model-context-pr
 - 🕐 Auto re-index: every search runs ~1ms change detection and, if notes changed, kicks ONE background index job (single-flight) — search itself never blocks on indexing
 - ✂️ 1500-char chunking for long notes
 - 🍎 Direct SQLite + protobuf decode — real note text, not garbled HTML
-- 🏃‍♂️ Fully local — no API keys, no cloud
+- 🏃‍♂️ On-device — embeddings, search, BM25, clustering, and bridges run locally with no API keys; only optional **synthesis generation** calls an LLM (local LM Studio/Ollama, or cloud OpenAI — your choice)
 
 ## Local web app — not just search, but connections & synthesis
 
