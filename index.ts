@@ -1072,7 +1072,7 @@ const startIndexJobLazy = async (tableName?: string) => {
 
 function registerTools(server: McpServer) {
 
-server.tool("create-note", CreateNoteSchema.shape, async ({ title, content }) => {
+server.tool("create-note", "Create a new Apple Note with the given title and content.", CreateNoteSchema.shape, async ({ title, content }) => {
   await createNote(title, content);
   return createTextResponse(`Created note "${title}" successfully.`);
 });
@@ -1084,7 +1084,7 @@ const ListNotesSchema = z.object({
   limit: z.number().int().min(1).max(500).optional().describe("Max results (default 50)"),
 });
 
-server.tool("list-notes", ListNotesSchema.shape, async ({ folder, modifiedAfter, modifiedBefore, limit = 50 }) => {
+server.tool("list-notes", "List Apple Notes by most recently modified, optionally filtered by folder or modification date range.", ListNotesSchema.shape, async ({ folder, modifiedAfter, modifiedBefore, limit = 50 }) => {
   try {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
@@ -1118,7 +1118,7 @@ server.tool("list-notes", ListNotesSchema.shape, async ({ folder, modifiedAfter,
   } catch (err) { handleDbError(err); }
 });
 
-server.tool("get-note", GetNoteSchema.shape, async ({ title }) => {
+server.tool("get-note", "Get the full content of a single Apple Note by title (exact match, with semantic-search fallback).", GetNoteSchema.shape, async ({ title }) => {
   // Try exact match first, fall back to semantic search
   const note = await getNoteDetailsByTitle(title);
   if (note && note.title) return createTextResponse(JSON.stringify(note));
@@ -1132,7 +1132,7 @@ server.tool("get-note", GetNoteSchema.shape, async ({ title }) => {
   return createTextResponse(JSON.stringify(best));
 });
 
-server.tool("update-note", UpdateNoteSchema.shape, async ({ title, content }) => {
+server.tool("update-note", "Replace the body of an existing Apple Note identified by its exact title.", UpdateNoteSchema.shape, async ({ title, content }) => {
   const script = `
     const app = Application('Notes');
     const matches = app.notes.whose({name: ${JSON.stringify(title)}});
@@ -1147,7 +1147,7 @@ server.tool("update-note", UpdateNoteSchema.shape, async ({ title, content }) =>
   return createTextResponse(`Updated note "${title}".`);
 });
 
-server.tool("list-folders", {}, async () => {
+server.tool("list-folders", "List all Apple Notes folders with their note counts.", {}, async () => {
   try {
     const db = new Database(NOTES_DB, { readonly: true });
     try {
@@ -1164,7 +1164,7 @@ server.tool("list-folders", {}, async () => {
   } catch (err) { handleDbError(err); }
 });
 
-server.tool("list-tags", {}, async () => {
+server.tool("list-tags", "List all hashtags used across your Apple Notes, ranked by frequency.", {}, async () => {
   const { notesTable } = await createNotesTable();
   const rows = await notesTable.query().select(["title", "content"]).limit(FULL_SCAN_LIMIT).toArray();
   const tagCounts = new Map<string, number>();
@@ -1182,7 +1182,7 @@ server.tool("list-tags", {}, async () => {
   return createTextResponse(JSON.stringify(sorted));
 });
 
-server.tool("search-by-tag", { tag: z.string().describe("Hashtag to search for, with or without leading #") }, async ({ tag }) => {
+server.tool("search-by-tag", "Find all Apple Notes containing a specific hashtag.", { tag: z.string().describe("Hashtag to search for, with or without leading #") }, async ({ tag }) => {
   const { notesTable } = await createNotesTable();
   const normalized = tag.replace(/^#/, "").toLowerCase();
   const rows = await notesTable.query().select(["title", "folder", "modification_date", "content"]).limit(FULL_SCAN_LIMIT).toArray();
@@ -1198,7 +1198,7 @@ server.tool("search-by-tag", { tag: z.string().describe("Hashtag to search for, 
   return createTextResponse(JSON.stringify(results));
 });
 
-server.tool("related-notes", {
+server.tool("related-notes", "Find notes related to a given note via shared tags, wikilinks/backlinks, and semantic similarity.", {
   title: z.string().describe("Exact title of the source note"),
   limit: z.number().int().min(1).max(20).optional().describe("Max results (default 10)"),
 }, async ({ title, limit = 10 }) => {
@@ -1247,7 +1247,7 @@ server.tool("related-notes", {
   return createTextResponse(JSON.stringify(results));
 });
 
-server.tool("bridge-notes", {
+server.tool("bridge-notes", "Surface non-obvious 'bridge' connections (Swanson-ABC) between otherwise unlinked notes.", {
   limit: z.number().int().min(1).max(200).optional().describe("Max bridges (default 20)"),
   folder: z.string().optional().describe("Only bridges where A or C is in this folder (exact path segment match)"),
 }, async ({ limit = 20, folder }) => {
@@ -1255,14 +1255,14 @@ server.tool("bridge-notes", {
   return createTextResponse(JSON.stringify({ ...selectBridges(mined, { limit, folder }), stale }));
 });
 
-server.tool("feed", {
+server.tool("feed", "Get a ranked feed of noteworthy items (bridges, clusters, resurfaced notes) across your Apple Notes.", {
   limit: z.number().int().min(1).max(100).optional().describe("Max feed items (default 20)"),
 }, async ({ limit = 20 }) => {
   const result = await serveFeed(0, limit);
   return createTextResponse(JSON.stringify(result));
 });
 
-server.tool("entity-notes", {
+server.tool("entity-notes", "Get all notes that mention a given entity (person, place, thing), with its thread of connections.", {
   entity: z.string().describe("Entity name, e.g. 'Mercedes' — case-insensitive, prefix/contains fallback"),
 }, async ({ entity }) => {
   const result = entityNotes(entity);
@@ -1270,7 +1270,7 @@ server.tool("entity-notes", {
   return createTextResponse(JSON.stringify(result));
 });
 
-server.tool("list-entities", {
+server.tool("list-entities", "List entities (people, places, things) extracted from your Apple Notes, with optional substring filter.", {
   query: z.string().optional().describe("Substring filter on entity labels"),
   limit: z.number().int().min(1).max(200).optional().describe("Max entities (default 30)"),
 }, async ({ query, limit = 30 }) => {
@@ -1279,14 +1279,14 @@ server.tool("list-entities", {
   return createTextResponse(JSON.stringify(result));
 });
 
-server.tool("get-tables", { title: z.string().describe("Exact note title") }, async ({ title }) => {
+server.tool("get-tables", "Extract structured tables from a specific Apple Note by title.", { title: z.string().describe("Exact note title") }, async ({ title }) => {
   const note = await getNoteDetailsByTitle(title);
   if (!note?.title) return createTextResponse(JSON.stringify({ error: `Note not found: "${title}"` }));
   const tables = extractTablesFromText(note.content ?? "");
   return createTextResponse(JSON.stringify({ title: note.title, tables, count: tables.length }));
 });
 
-server.tool("check-changes", {}, async () => {
+server.tool("check-changes", "Check whether Apple Notes have changed since the last index, and how many notes are affected.", {}, async () => {
   const currentMax = getNotesMaxModDate();
   const hasChanges = currentMax !== null && (lastIndexedModDate === null || currentMax > lastIndexedModDate);
   let changedCount = 0;
@@ -1309,14 +1309,14 @@ server.tool("check-changes", {}, async () => {
   }));
 });
 
-server.tool("search-notes", QueryNotesSchema.shape, async ({ query, folder, modifiedAfter, modifiedBefore }) => {
+server.tool("search-notes", "Hybrid semantic + keyword search across your Apple Notes; returns the most relevant notes for a query.", QueryNotesSchema.shape, async ({ query, folder, modifiedAfter, modifiedBefore }) => {
   kickReindexIfNeeded();
   const { notesTable } = await createNotesTable();
   const combinedResults = await searchAndCombineResults(notesTable, query, 20, folder, modifiedAfter, modifiedBefore);
   return createTextResponse(JSON.stringify(combinedResults));
 });
 
-server.tool("find-notes", QueryNotesSchema.shape, async ({ query, folder, modifiedAfter, modifiedBefore }) => {
+server.tool("find-notes", "Literal substring/keyword search across Apple Notes (with hyphen variants), returning matching snippets.", QueryNotesSchema.shape, async ({ query, folder, modifiedAfter, modifiedBefore }) => {
   kickReindexIfNeeded();
   const { notesTable } = await createNotesTable();
 
@@ -1374,7 +1374,7 @@ server.tool("find-notes", QueryNotesSchema.shape, async ({ query, folder, modifi
   return createTextResponse(JSON.stringify(results));
 });
 
-server.tool("index-health", {}, async () => {
+server.tool("index-health", "Report index health: last indexed time, current max modification date, sync status, and total note count.", {}, async () => {
   const maxMod = getNotesMaxModDate();
   const totalNotes = (() => {
     try {
@@ -1393,7 +1393,7 @@ server.tool("index-health", {}, async () => {
   }));
 });
 
-server.tool("index-notes-blocking", {}, async (_args, extra) => {
+server.tool("index-notes-blocking", "Index Apple Notes synchronously and return only when done (no background job). Use this when you want indexing completed in one step.", {}, async (_args, extra) => {
   const { notesTable } = await createNotesTable();
   const { time, chunks } = await indexNotes(notesTable, extra);
   markIndexed();
@@ -1418,12 +1418,12 @@ registerAppTool(
   }
 );
 
-server.tool("start-index-notes", StartIndexNotesSchema.shape, async ({ tableName }) => {
+server.tool("start-index-notes", "Start a background indexing job for Apple Notes and return a jobId immediately (poll index-notes-status for progress).", StartIndexNotesSchema.shape, async ({ tableName }) => {
   const jobId = await startIndexJobLazy(tableName);
   return createTextResponse(JSON.stringify({ jobId }));
 });
 
-server.tool("index-notes-status", JobIdSchema.shape, async ({ jobId }) => {
+server.tool("index-notes-status", "Get the status, progress, and result of a background indexing job by jobId.", JobIdSchema.shape, async ({ jobId }) => {
   const job = indexJobs.get(jobId);
   if (!job) return createTextResponse(`Unknown jobId: ${jobId}`);
   return createTextResponse(
@@ -1440,7 +1440,7 @@ server.tool("index-notes-status", JobIdSchema.shape, async ({ jobId }) => {
   );
 });
 
-server.tool("index-notes-logs", JobLogsSchema.shape, async ({ jobId, offset }) => {
+server.tool("index-notes-logs", "Fetch incremental log lines for a background indexing job by jobId and offset.", JobLogsSchema.shape, async ({ jobId, offset }) => {
   const job = indexJobs.get(jobId);
   if (!job) return createTextResponse(`Unknown jobId: ${jobId}`);
   const start = offset ?? 0;
@@ -1454,7 +1454,7 @@ server.tool("index-notes-logs", JobLogsSchema.shape, async ({ jobId, offset }) =
   );
 });
 
-server.tool("cancel-index-notes", JobIdSchema.shape, async ({ jobId }) => {
+server.tool("cancel-index-notes", "Request cancellation of a running background indexing job by jobId.", JobIdSchema.shape, async ({ jobId }) => {
   const job = indexJobs.get(jobId);
   if (!job) return createTextResponse(`Unknown jobId: ${jobId}`);
   job.cancelled = true;
